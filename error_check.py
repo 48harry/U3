@@ -3,11 +3,13 @@ import glob
 import os
 
 # 1. 파일 경로 설정
-train_path = './train'
-test_path = './test'
-all_files = [p.replace("\\", "/") for p in glob.glob(os.path.join(train_path, "*.csv"))]
-all_files.append(p.replace("\\", "/") for p in glob.glob(os.path.join(test_path, "*.csv")))
+folder_paths = ["./train", "./test"]
+all_files = []
 
+for folder in folder_paths:
+    files = glob.glob(os.path.join(folder, "*.csv"))
+    all_files.extend([p.replace("\\", "/") for p in files])
+    
 # 모든 고유한 에러 값을 저장할 집합(set) 생성
 unique_errors = set()
 

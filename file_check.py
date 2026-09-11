@@ -3,11 +3,13 @@ import glob
 import os
 
 # 1. 파일 경로 설정 (유저 환경에 맞게 폴더 경로를 수정해 주세요)
-folder_path = "C:/Users/a0106/Desktop/U3"
-all_files = [
-    p.replace("\\", "/") for p in glob.glob(os.path.join(folder_path, "*.csv"))
-]
-# 분석 결과를 담을 리스트
+folder_paths = ["./train", "./test"]
+all_files = []
+
+for folder in folder_paths:
+    files = glob.glob(os.path.join(folder, "*.csv"))
+    all_files.extend([p.replace("\\", "/") for p in files])
+
 summary_data = []
 time_col = 'time'
 
