@@ -4,7 +4,14 @@
 - 자동차 제조업에서 광범위하게 쓰이는 **저항 점용접기(RSW)의 고장을 예측**하기 위한 다변량 시계열 데이터셋, 실제 차체 공장에서 **3년 이상 가동된 수십대의 용접기로부터 수집된 데이터**
 
 - 용접기의 제어 오류는 예기치 않은 가동 중단을 유발하므로 과거 관측 데이터를 통해 사전에 기계적 결함을 **예측하고 유지보수 전략을 세우는 것이 핵심**
+
 ##### 데이터셋 설명
+
+**데이터 수집과정**
+
+![The constructive process and the description of the welding gun fault prediction benchmark data set](image.png)
+
+**데이터 설명**
 
 - 컬럼 : time / c01-19 / error(target) (총 21개)
 - 행 : 1hz(1sec)주기로 7일정도 (총 60만개 정도) / 기간은 에러별로 다름
@@ -13,9 +20,21 @@
 >> Dataset 양 자체는 sufficient (4800만 행)
 >> 어느정도 환경이면 ML이나 1D CNN정도는 수월하게 돌아감
 
+파이프라인 시사점: 우리는 이 'Diagnose rules'를 모델에 직접 넣는 것이 아닙니다. 이 규칙을 통해 도출된 최종 결과물인 에러(E01~E04)를 모델의 '정답(Target)'으로 삼아 센서 데이터 패턴과 역산하여 매핑(Classification)하도록 학습시켜야 합니다.
+이 2-way 메커니즘이 이해가 안될시 실제 데이터를 열어보며 확인할것.
+
+**논문 설명 발췌**
+
+The leading car manufacturer has been relying on the pinpoint accuracy
+and efficiency of servo-pneumatic welding guns for many years
+
 The resistance spot welding (RSW) welding gun fault prediction benchmark data set has **72 multivariate time series in the training set and 8 in the testing set.** Each time series length 604800(apx.) sampled at 1 Hz with missing values and has 20 dimensions (c1-c19 and the error code). We retain the missing value and the outliers of the welding gun time series for the potential of imputation research in the future.
 
+RSW guns are highly nonlinear dynamical machinery systems with interesting physical phenomena over multiple time-dependent components.
+
 This dataset is suitable for a **time series forecasting task**, where machine learning models can be **trained to predict future welding parameters based on the provided welding parameters time series in history.** 
+
+The dataset contains real-world multivariate time series data over 3 years from 80 RSW guns running at the production line of the body-shop of a leading car manufacturer
 
 - time : time detail 참고
 
