@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## Project Memory
+- **Read `MEMORY.md` first** on every task. It records the design decisions and their rationale (data facts, preprocessing rules, model/serving contracts, code conventions, open issues). `readme.md` §5 describes the workflow and file layout.
+- When a decision changes, update the matching section in `MEMORY.md` and add a line to its 변경 이력. Don't duplicate what the code or `readme.md` already states.
+
 ## Build & Test Commands
 - **Run Server**: `uvicorn main:app --reload`
 - **Run Tests**: `pytest`

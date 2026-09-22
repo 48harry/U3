@@ -180,3 +180,130 @@ E001, E016, E028 같은 수많은 코드들은 기계를 멈출 정도는 아니
 - **잔고장 로그를 '입력 피처(Feature)'로 전환** 자잘한 에러(예: E016 등)가 반복해서 튀는 현상 자체가 곧 큰 고장이 날 것이라는 훌륭한 전조 증상일 수 있습니다. 따라서 `error` 컬럼을 단순한 정답지로 버리지 말고, **"최근 10분간 발생한 마이너 에러 누적 횟수"** 와 같은 시계열 파생 변수(Feature)로 만들어 모델의 입력값으로 쓴다면 분류 성능을 크게 끌어올릴 수 있습니다.
 
 - 사소한 문제 : E02_2 데이터가 없어서 demo로 대체했음
+
+---
+
+### 5. 구현 워크플로우 (2026-09-22 기준)
+
+```
+train/*.csv ──► .py/eda.py ──► eda_out/          (탐색, 전처리 규칙 근거)
+     │
+     └──────► .py/preprocess.py ──► preprocessed/*.parquet + scaler.json
+                                          │
+                                          ▼
+                                   .py/train.py ──► models/baseline_iforest.joblib
+                                                            │
+                                                            ▼
+                               main.py (FastAPI) ──► AnomalyResult JSON ──► 온톨로지 / RAG 단계
+```
+
+| 파일 | 역할 | 입력 → 출력 |
+|---|---|---|
+| `.py/Benchmark.py` | 논문 벤치마크 원본 (Zenodo) — 참고용, 실행 불가 | — |
+| `.py/Benchmark_fixed.py` | 원본의 버그만 고친 재현본 (Stage 1 시계열 예측) | `train/`,`test/` → `results/` |
+| `.py/eda.py` | 72개 학습 파일 EDA | `train/` → `eda_out/` |
+| `.py/preprocess.py` | 이상탐지용 전처리 | `train/` → `preprocessed/` |
+| `.py/train.py` | 이상탐지 베이스라인 학습·평가·저장 | `preprocessed/` → `models/` |
+| `main.py` | 실시간 추론 API | `models/` + 센서 스트림 → JSON |
+
+모든 스크립트는 경로를 `__file__` 기준(프로젝트 루트)으로 잡으므로 어느 디렉터리에서 실행해도 된다.
+
+#### 5.1 벤치마크 코드 리뷰 (`Benchmark.py` → `Benchmark_fixed.py`)
+
+원본은 그대로 실행되지 않는다. 고친 것:
+
+- 모든 플롯이 `predl_NBEATS`(마지막에야 정의됨)를 그림 → `NameError`
+- 테스트 시계열 전체를 넣고 그 **끝 이후**를 예측해 실측과 겹치는 구간이 없음 → 마지막 `N_PRED`초를 홀드아웃
+- PNG 파일명이 `file_name[-4:]`(=".csv")라 테스트 파일끼리 덮어씀
+- `accelerator="gpu"` 하드코딩(이 PC는 CPU torch) → `"auto"`
+- TFT는 future covariate가 없으면 `add_relative_index=True` 필요
+- `darts.mape`는 실측에 0이 있으면 예외(c2·c4는 50~85%가 0) → NaN 처리, MARRE 추가
+- pandas 2.x에서 제거된 `resample('S')`, `fillna(method=)`, `to_numeric(errors='ignore')`
+- 선행 결측 bfill, 이상치 마스킹을 원-핫 **이전**에 수행, 죽은 `switch` 로직 제거
+- 논문 규칙대로 결측률 40% 초과 파일 폐기
+
+10개 모델 전체 학습은 수십 시간 규모라 축소 스모크 테스트만 시도했고, 메모리 부족으로 중단되어 **학습~평가 경로는 아직 실측 검증되지 않았다**(임포트·API 명·경로만 확인).
+
+#### 5.2 EDA (`python .py/eda.py`, 72파일 약 40분)
+
+산출물: `eda_out/eda_report.md`(요약), `file_summary.csv`, `error_episodes.csv`, `scm_*.csv`, `01~09_*.png`, `files/<파일>.png`
+
+핵심 발견 — 전처리·모델링 결정의 근거:
+
+| 발견 | 수치 | 결정 |
+|---|---|---|
+| 결측은 행 단위 block-out | E01/03/04 ~1%, gap 99%가 ≤35초, 최장 ~1h. **E02 8개 파일이 64~84%** | 40% 초과 폐기(논문), ≤60초 ffill, 긴 gap은 세그먼트 분리 |
+| c16 이상치 = 캡 드레싱 | 파일당 1~45%, 평균 11% | 센서값 carry-forward + `non_welding` 플래그 |
+| **error 컬럼은 이벤트가 아니라 상태** | E003 에피소드 중앙값 1.5~2h, 최장 28h | 에피소드 단위 집계, `error_active`/`error_share_10min` 피처 |
+| 클래스별 종료 코드가 거의 결정적 | E01→E012 18/18, E02→E016 17/18, E03→E028 18/18, E04→E029 18/18 (모두 고장 전 10분 내) | `terminal_code` 플래그, API의 `known_code_class_hint` |
+| c7·c8·c9는 파일 내 상수 | 69/72 파일 | 건 고유 속성(정적 공변량), `--drop-static` 옵션 |
+| c11·c12는 누적 카운터 | 절대값이 건마다 다름 | 증분 + 10분 롤링 합으로 대체 |
+| 수집 시기 | E02 일부는 2019-12~2020-07, 나머지는 2021-08~10 | 타임라인 확인용 `04_collection_timeline.png` |
+| 타깃 상관 | c2↔c4 +0.94, c2↔c18 +0.89, c2↔c13 −0.88 | 논문 SCM 재현(`scm_overall.csv`) |
+
+readme 2절의 "잔고장 코드를 전조 피처로" 가설은 절반만 맞다: 종료 코드는 고장 10분 전에야 나타나고, E003·E011·E029는 며칠 전부터 장시간 지속되는 상태라 단독 전조로는 약하다.
+
+#### 5.3 전처리 (`python .py/preprocess.py`, 약 5분)
+
+출력: `preprocessed/<파일>.parquet`(1 Hz, float32), `manifest.csv`(파일별 행·세그먼트·폐기 사유), `scaler.json`(정상행 z-score 파라미터), `preprocess_config.json`
+
+컬럼: `file, class, gun, segment_id` · 센서 `c1~c9, c13~c19`(z-score), `c10`(0/1) · 파생 `welds_delta, pos_delta, welds_10min, weld_duty_10min, error_share_10min, hour_sin, hour_cos, dow` · 상태 `error_code, error_active, terminal_code, non_welding` · 레이블 `ttf_s`(고장까지 초), `label`(마지막 3600초=1)
+
+주요 옵션: `--max-missing-rate 0.4`, `--gap-fill-limit 60`, `--pre-failure-window 3600`, `--resample 10s`, `--scale global|per-file|none`, `--drop-static`
+
+결과: 64/72 파일, 37.6M행. 스케일러는 `label==0 & error_active==0` 행으로만 fit.
+
+#### 5.4 이상탐지 베이스라인 (`python .py/train.py`)
+
+- 60초 윈도우로 집계(연속 피처 24개 × mean/std = 48 피처, ~60만 윈도우), **파일(=건) 단위** 층화 분할 25% 검증
+- IsolationForest(300 trees), 정상 윈도우(`label==0 & error_active==0`) 464,816개로 학습
+- 임계값 = 학습 정상 점수의 99% 분위수(0.5406)
+
+검증(16개 건, 고장 전 1h vs 정상):
+
+| | AUROC | recall@1h | 정상 알람률 |
+|---|---|---|---|
+| 전체 | 0.639 | 0.051 | 0.015 |
+| E01 | 0.687 | 0.016 | 0.001 |
+| E02 | 0.789 | 0.298 | 0.058 |
+| E03 | 0.633 | 0.004 | 0.018 |
+| E04 | 0.589 | 0.008 | 0.004 |
+
+→ 오탐률은 설계대로 1%대지만 **고장 전 1시간을 거의 못 잡는다**. 기준선일 뿐이다.
+
+저장: `models/baseline_iforest.joblib` = `{model, feature_cols, model_cols, window, threshold, sustain, scaler, feature_reference, metrics, train/val_files}`. 추론은 `from train import load_bundle, score_frame` 또는 `python .py/train.py --score preprocessed/E04_3.parquet`.
+
+#### 5.5 실시간 추론 API (`uvicorn main:app --reload`)
+
+| 메서드 | 경로 | 역할 |
+|---|---|---|
+| POST | `/predict` | `{gun_id, readings:[SensorReading]}` → 건별 30분 버퍼에 추가, 최신 60초 윈도우 스코어링. 60초 미만이면 `202 warming_up` |
+| GET | `/model`, `/health`, `/guns` | 모델 카드 / 상태 / 건별 버퍼·연속 알람 |
+| DELETE | `/guns/{gun_id}` | 버퍼 리셋 |
+
+입력 `SensorReading`은 CSV 컬럼 그대로(`time, c1~c19, error`; `c10`은 on/off·bool 허용, `error`는 `^(0|E\d{3})$`). 서버가 전처리를 온라인으로 동일 적용한다.
+
+출력 `AnomalyResult`(온톨로지 단계 입력):
+
+```json
+{"gun_id": "G0", "status": "ok", "window_start": "...", "window_end": "...", "n_samples": 60, "history_s": 1809,
+ "is_anomaly": true, "anomaly_score": 0.61, "threshold": 0.54, "score_z": 4.6,
+ "severity": "critical", "sustained_alarm": true, "consecutive_alarms": 3,
+ "contributing_features": [{"feature": "c5_mean", "sensor": "c5", "sensor_name": "Balance pressure",
+                            "statistic": "mean", "value": -3.1, "reference": 0.02, "contribution": 0.08, "share": 0.41}],
+ "context": {"latest_error_code": "E029", "error_active_share": 1.0, "non_welding_share": 0.0,
+             "welds_in_window": 0, "welds_10min": 12, "weld_duty_10min": 0.02, "known_code_class_hint": "E04"},
+ "model": {"name": "baseline_iforest", "type": "iforest", "window_s": 60, "threshold": 0.54, "sustain": 3, "n_features": 48}}
+```
+
+- `severity`: `normal`(임계 미만) / `warning`(초과) / `critical`(`sustain`=3회 연속 초과) — 3절의 "연속 N회일 때만 RAG 트리거" 기준
+- `contributing_features`: 각 피처를 정상 기준값으로 치환했을 때 점수 감소량(모델 무관), 상위 8개
+- 요청당 ~60 ms(1,100행 append 포함)
+
+#### 5.6 현재 한계와 다음 단계
+
+1. 현재 `models/baseline_iforest.joblib`은 `feature_reference` 추가 **이전**에 학습된 것이라 API의 기여도 기준값이 0으로 대체된다 → `python .py/train.py` 재학습 필요.
+2. 베이스라인은 종료 상태(E029 등)조차 임계값 아래로 본다. 시도할 것: `preprocess.py --scale per-file --drop-static`(건 간 오프셋 제거), 윈도우 길이 확대, 시퀀스 모델(LSTM-AE 등), 그리고 `label`을 쓰는 지도학습 비교.
+3. E01_0은 고장 직전 1시간의 85%가 `non_welding` — 고장이 정비 중 발생하는 패턴인지 72파일에서 확인해야 하며, 그렇다면 `non_welding`을 입력에서 빼야 모델이 플래그만 외우지 않는다.
+4. 서빙 윈도우는 트레일링 60초, 학습 윈도우는 분 경계 정렬 — 정확히 맞추려면 서빙도 분 경계로 자른다.
+5. `Benchmark_fixed.py`의 실제 학습 경로는 미검증.

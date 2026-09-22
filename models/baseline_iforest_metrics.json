@@ -1,0 +1,381 @@
+{
+  "model_type": "iforest",
+  "feature_cols": [
+    "welds_delta",
+    "pos_delta",
+    "welds_10min",
+    "weld_duty_10min",
+    "error_share_10min",
+    "c1",
+    "c2",
+    "c3",
+    "c4",
+    "c5",
+    "c6",
+    "c7",
+    "c8",
+    "c9",
+    "c13",
+    "c14",
+    "c15",
+    "c16",
+    "c17",
+    "c18",
+    "c19",
+    "c10",
+    "hour_sin",
+    "hour_cos"
+  ],
+  "model_cols": [
+    "welds_delta_mean",
+    "pos_delta_mean",
+    "welds_10min_mean",
+    "weld_duty_10min_mean",
+    "error_share_10min_mean",
+    "c1_mean",
+    "c2_mean",
+    "c3_mean",
+    "c4_mean",
+    "c5_mean",
+    "c6_mean",
+    "c7_mean",
+    "c8_mean",
+    "c9_mean",
+    "c13_mean",
+    "c14_mean",
+    "c15_mean",
+    "c16_mean",
+    "c17_mean",
+    "c18_mean",
+    "c19_mean",
+    "c10_mean",
+    "hour_sin_mean",
+    "hour_cos_mean",
+    "welds_delta_std",
+    "pos_delta_std",
+    "welds_10min_std",
+    "weld_duty_10min_std",
+    "error_share_10min_std",
+    "c1_std",
+    "c2_std",
+    "c3_std",
+    "c4_std",
+    "c5_std",
+    "c6_std",
+    "c7_std",
+    "c8_std",
+    "c9_std",
+    "c13_std",
+    "c14_std",
+    "c15_std",
+    "c16_std",
+    "c17_std",
+    "c18_std",
+    "c19_std",
+    "c10_std",
+    "hour_sin_std",
+    "hour_cos_std"
+  ],
+  "window": 60,
+  "threshold": 0.5406155362705533,
+  "threshold_q": 0.99,
+  "sustain": 3,
+  "scaler": {
+    "scale": "global",
+    "columns": [
+      "c1",
+      "c2",
+      "c3",
+      "c4",
+      "c5",
+      "c6",
+      "c7",
+      "c8",
+      "c9",
+      "c13",
+      "c14",
+      "c15",
+      "c16",
+      "c17",
+      "c18",
+      "c19",
+      "welds_delta",
+      "welds_10min",
+      "pos_delta"
+    ],
+    "params": {
+      "c1": {
+        "mean": 1.9029312897593602,
+        "std": 1.4388473246085833
+      },
+      "c2": {
+        "mean": 384.00929193694145,
+        "std": 999.350274080566
+      },
+      "c3": {
+        "mean": 102.7412762226574,
+        "std": 64.74217527959317
+      },
+      "c4": {
+        "mean": 0.10057088310240463,
+        "std": 0.3007596724536172
+      },
+      "c5": {
+        "mean": 413.3609152528521,
+        "std": 1447.310176251993
+      },
+      "c6": {
+        "mean": -49.115212357903424,
+        "std": 118.32239986604024
+      },
+      "c7": {
+        "mean": 177.1808597537385,
+        "std": 47.77848693728684
+      },
+      "c8": {
+        "mean": 5448.212445416415,
+        "std": 947.421418146866
+      },
+      "c9": {
+        "mean": 233.16442233603243,
+        "std": 156.33789931212794
+      },
+      "c13": {
+        "mean": 14.350100563646535,
+        "std": 2.214219021981598
+      },
+      "c14": {
+        "mean": 2937.906547703182,
+        "std": 740.8154828132466
+      },
+      "c15": {
+        "mean": 118.07431119694985,
+        "std": 55.1068229326201
+      },
+      "c16": {
+        "mean": 2.520756305571674,
+        "std": 0.7423644275968816
+      },
+      "c17": {
+        "mean": 1.0,
+        "std": 1.0
+      },
+      "c18": {
+        "mean": 0.12343882972638216,
+        "std": 0.3289402453974937
+      },
+      "c19": {
+        "mean": 1072989494.901614,
+        "std": 120468571.49742158
+      },
+      "welds_delta": {
+        "mean": 3.0819649361269277,
+        "std": 516.2337889447131
+      },
+      "welds_10min": {
+        "mean": 1782.7099499322137,
+        "std": 40705.504882564535
+      },
+      "pos_delta": {
+        "mean": 497.2281024204858,
+        "std": 89827.27158215911
+      }
+    },
+    "n_fit_rows": 35926094
+  },
+  "train_files": [
+    "E01_0.parquet",
+    "E01_1.parquet",
+    "E01_10.parquet",
+    "E01_11.parquet",
+    "E01_12.parquet",
+    "E01_13.parquet",
+    "E01_15.parquet",
+    "E01_16.parquet",
+    "E01_17.parquet",
+    "E01_2.parquet",
+    "E01_3.parquet",
+    "E01_5.parquet",
+    "E01_6.parquet",
+    "E01_7.parquet",
+    "E02_10.parquet",
+    "E02_11.parquet",
+    "E02_12.parquet",
+    "E02_13.parquet",
+    "E02_14.parquet",
+    "E02_15.parquet",
+    "E02_16.parquet",
+    "E02_17.parquet",
+    "E03_0.parquet",
+    "E03_1.parquet",
+    "E03_11.parquet",
+    "E03_12.parquet",
+    "E03_13.parquet",
+    "E03_15.parquet",
+    "E03_16.parquet",
+    "E03_17.parquet",
+    "E03_4.parquet",
+    "E03_5.parquet",
+    "E03_6.parquet",
+    "E03_7.parquet",
+    "E03_8.parquet",
+    "E03_9.parquet",
+    "E04_0.parquet",
+    "E04_1.parquet",
+    "E04_10.parquet",
+    "E04_11.parquet",
+    "E04_13.parquet",
+    "E04_14.parquet",
+    "E04_16.parquet",
+    "E04_17.parquet",
+    "E04_2.parquet",
+    "E04_3.parquet",
+    "E04_5.parquet",
+    "E04_6.parquet",
+    "E04_7.parquet",
+    "E04_9.parquet"
+  ],
+  "val_files": [
+    "E01_14.parquet",
+    "E01_4.parquet",
+    "E01_8.parquet",
+    "E01_9.parquet",
+    "E02_1.parquet",
+    "E02_9.parquet",
+    "E03_10.parquet",
+    "E03_14.parquet",
+    "E03_2.parquet",
+    "E03_3.parquet",
+    "E04_12.parquet",
+    "E04_15.parquet",
+    "E04_4.parquet",
+    "E04_8.parquet"
+  ],
+  "metrics": {
+    "train": {
+      "n_fit_windows": 464816,
+      "threshold": 0.5406155362705533,
+      "score_mean": 0.41622749652901214,
+      "score_std": 0.041868651058276245
+    },
+    "val": {
+      "n_windows": 140290,
+      "n_pre_failure": 836,
+      "n_normal": 133750,
+      "auroc": 0.6392224703685453,
+      "auprc": 0.011941796258843411,
+      "alarm_rate_normal": 0.014773831775700935,
+      "recall_pre_failure": 0.05143540669856459,
+      "alarm_rate_error_state": 0.007125890736342043,
+      "per_class": {
+        "E01": {
+          "auroc": 0.6868389716114753,
+          "recall_pre_failure": 0.01639344262295082,
+          "alarm_rate_normal": 0.0006322944384435018
+        },
+        "E02": {
+          "auroc": 0.7886773301854564,
+          "recall_pre_failure": 0.2975206611570248,
+          "alarm_rate_normal": 0.05777016505761445
+        },
+        "E03": {
+          "auroc": 0.6333056944738571,
+          "recall_pre_failure": 0.004347826086956522,
+          "alarm_rate_normal": 0.017510322679308764
+        },
+        "E04": {
+          "auroc": 0.5891637054002964,
+          "recall_pre_failure": 0.008298755186721992,
+          "alarm_rate_normal": 0.004075831925562438
+        }
+      },
+      "per_file": {
+        "E01_14": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.0,
+          "alarm_rate_normal": 9.971083856815236e-05
+        },
+        "E01_4": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.0,
+          "alarm_rate_normal": 0.0004999500049995
+        },
+        "E01_8": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.0,
+          "alarm_rate_normal": 0.0008799912000879991
+        },
+        "E01_9": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.16663420128408624,
+          "alarm_rate_normal": 0.0011317338162064282
+        },
+        "E02_1": {
+          "final_alarm_run_starts_h_before_failure": 0.15138888888888888,
+          "false_alarm_runs_per_day": 0.0,
+          "alarm_rate_normal": 0.0022668393782383418
+        },
+        "E02_9": {
+          "final_alarm_run_starts_h_before_failure": 0.16277777777777777,
+          "false_alarm_runs_per_day": 13.652813695979773,
+          "alarm_rate_normal": 0.10917816436712657
+        },
+        "E03_10": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.16649099040942525,
+          "alarm_rate_normal": 0.06613146011038636
+        },
+        "E03_14": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.0,
+          "alarm_rate_normal": 0.0009736045002163566
+        },
+        "E03_2": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.0,
+          "alarm_rate_normal": 0.0
+        },
+        "E03_3": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.16648457416367515,
+          "alarm_rate_normal": 0.0018982915376161455
+        },
+        "E04_12": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.0,
+          "alarm_rate_normal": 0.0017115472387037882
+        },
+        "E04_15": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.0,
+          "alarm_rate_normal": 0.0003496911061895326
+        },
+        "E04_4": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.0,
+          "alarm_rate_normal": 0.011990407673860911
+        },
+        "E04_8": {
+          "final_alarm_run_starts_h_before_failure": NaN,
+          "false_alarm_runs_per_day": 0.0,
+          "alarm_rate_normal": 0.001408167370750352
+        }
+      }
+    }
+  },
+  "args": {
+    "data_dir": "c:\\Users\\a0106\\Desktop\\U3\\preprocessed",
+    "model_dir": "c:\\Users\\a0106\\Desktop\\U3\\models",
+    "model": "iforest",
+    "window": 60,
+    "val_frac": 0.25,
+    "threshold_q": 0.99,
+    "sustain": 3,
+    "exclude_non_welding": false,
+    "max_train_windows": null,
+    "max_files": null,
+    "seed": 42,
+    "score": null
+  },
+  "created": "2026-09-22T16:33:02"
+}
