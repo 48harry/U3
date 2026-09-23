@@ -86,3 +86,4 @@
 - 2026-09-22: 최초 작성. Benchmark 리뷰/수정, EDA, 전처리, IsolationForest 베이스라인, FastAPI 서빙까지의 결정 정리.
 - 2026-09-23: 테스트 8파일 전처리(`--split test`, train 설정·스케일러 재사용, 종료 코드로 클래스 추론)와 테스트 평가(`train.py` 학습 후 자동 + `--evaluate`) 추가. §3·§4·§7-6 갱신.
 - 2026-09-23: 파이프라인 점검. gap 채움 버그(ffill+bfill → 120초) 수정 후 전처리·재학습, 번들에 `preprocess_config` 포함, 서빙이 그것을 읽도록 변경, 합성 데이터 E2E 테스트(`tests/`)·`requirements.txt`·`pyproject.toml` 추가. §3·§4·§5·§6·§7 갱신(미결 1번 해소).
+- 2026-09-23: `readme.md` 0~4절 재정리(사실 오류 수정: error 코드는 11종·원본 4,243만 행·결측 40% 초과 E02 8개, 파일명 표기 `test_0.csv`/`E01_0.csv`, c9 Start friction, c16 임계는 논문 6이 아닌 코드 5). 초기 구상과 EDA 후 바뀐 결정을 〔수정〕 표시로 구분.
