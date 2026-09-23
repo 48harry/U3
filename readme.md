@@ -183,34 +183,65 @@ E001, E016, E028 같은 수많은 코드들은 기계를 멈출 정도는 아니
 
 ---
 
-### 5. 구현 워크플로우 (2026-09-22 기준)
+### 5. 구현 워크플로우 (2026-09-23 기준)
+
+설계 결정의 **이유**는 `MEMORY.md`에, 각 단계의 **동작**은 스크립트 docstring에 있다. 이 절은 "무엇을 어떤 순서로 돌리면 무엇이 나오는지"만 적는다.
+
+#### 5.0 한눈에 보기
 
 ```
-train/*.csv ──► .py/eda.py ──► eda_out/          (탐색, 전처리 규칙 근거)
-     │
-     └──────► .py/preprocess.py ──► preprocessed/*.parquet + scaler.json
-                                          │
-                                          ▼
-                                   .py/train.py ──► models/baseline_iforest.joblib
-                                                            │
-                                                            ▼
-                               main.py (FastAPI) ──► AnomalyResult JSON ──► 온톨로지 / RAG 단계
+                 ┌──────────────────────────────────────────────────────────────────┐
+ train/*.csv ──► │ .py/eda.py                                                       │──► eda_out/
+  (72파일)        │   탐색 · 전처리 규칙의 근거                                          │
+                 └──────────────────────────────────────────────────────────────────┘
+ train/*.csv ──► .py/preprocess.py ─────────► preprocessed/*.parquet
+                                                + scaler.json, preprocess_config.json, manifest.csv
+                                                        │ (설정·스케일러 재사용)
+ test/*.csv ───► .py/preprocess.py --split test ───────┴► preprocessed/test/*.parquet + manifest.csv
+  (8파일)
+ preprocessed/ ─► .py/train.py ─────────────► models/baseline_iforest.joblib   (모델 + 스케일러 + 전처리 설정 + 검증/테스트 지표)
+                                              models/baseline_iforest_metrics.json
+                  .py/train.py --evaluate ──► models/baseline_iforest_test_metrics.json, models/scores/test_N_iforest.csv
+ models/ ───────► main.py (FastAPI) ────────► AnomalyResult JSON ──► 온톨로지 / RAG / LLM 리포트 / Slack (3절, 미구현)
 ```
 
-| 파일 | 역할 | 입력 → 출력 |
-|---|---|---|
-| `.py/Benchmark.py` | 논문 벤치마크 원본 (Zenodo) — 참고용, 실행 불가 | — |
-| `.py/Benchmark_fixed.py` | 원본의 버그만 고친 재현본 (Stage 1 시계열 예측) | `train/`,`test/` → `results/` |
-| `.py/eda.py` | 72개 학습 파일 EDA | `train/` → `eda_out/` |
-| `.py/preprocess.py` | 이상탐지용 전처리 | `train/` → `preprocessed/` |
-| `.py/train.py` | 이상탐지 베이스라인 학습·평가·저장 | `preprocessed/` → `models/` |
-| `main.py` | 실시간 추론 API | `models/` + 센서 스트림 → JSON |
+| 단계 | 명령 | 입력 → 출력 | 소요 |
+|---|---|---|---|
+| 0. 스모크 테스트 | `pytest` | 합성 데이터 → 임시 폴더 | 15초 |
+| 1. EDA (선택) | `python .py/eda.py` | `train/` → `eda_out/` | 40분 |
+| 2. 전처리(학습) | `python .py/preprocess.py` | `train/` → `preprocessed/` | 7분 |
+| 3. 전처리(테스트) | `python .py/preprocess.py --split test` | `test/` + 2단계 산출물 → `preprocessed/test/` | 40초 |
+| 4. 학습·평가 | `python .py/train.py` | `preprocessed/` → `models/` | 1분 |
+| 4'. 테스트 재평가 | `python .py/train.py --evaluate` | `models/` + `preprocessed/test/` → `models/` | 20초 |
+| 5. 서빙 | `uvicorn main:app --reload` | `models/` + 센서 스트림 → JSON | — |
 
-모든 스크립트는 경로를 `__file__` 기준(프로젝트 루트)으로 잡으므로 어느 디렉터리에서 실행해도 된다.
+한 번에: `python .py/preprocess.py && python .py/preprocess.py --split test && python .py/train.py` (약 9분). 순서가 중요하다 — 3단계는 2단계의 `scaler.json`·`preprocess_config.json`을 읽고, 4단계는 3단계 산출물이 있어야 테스트 지표를 낸다.
 
-#### 5.1 벤치마크 코드 리뷰 (`Benchmark.py` → `Benchmark_fixed.py`)
+#### 5.1 환경과 파일 배치
 
-원본은 그대로 실행되지 않는다. 고친 것:
+```
+U3/
+├─ train/  test/           원본 CSV (0절 링크, git 제외)
+├─ preprocessed/           2·3단계 산출물 (git 제외)
+│   └─ test/
+├─ eda_out/                1단계 산출물
+├─ models/                 4단계 산출물 (joblib 번들, 지표 JSON, scores/)
+├─ .py/                    스크립트: eda.py, preprocess.py, train.py, Benchmark.py(원본), Benchmark_fixed.py,
+│                          error_check.py·file_check.py(원본 CSV 점검용 단발 스크립트)
+├─ main.py                 FastAPI 서빙
+├─ tests/test_pipeline.py  E2E 스모크 테스트
+├─ requirements.txt  pyproject.toml  (ruff/black 120자, Benchmark.py·pic code/ 제외)
+├─ MEMORY.md               설계 결정 기록 · CLAUDE.md  작업 규약 · docs/  논문
+└─ pic code/               논문 그림 재현 스크립트 (파이프라인과 무관)
+```
+
+- Python 3.11, CPU 전용. `pip install -r requirements.txt`.
+- 모든 스크립트는 `__file__` 기준으로 프로젝트 루트를 잡으므로 어느 디렉터리에서 실행해도 된다. 데이터 폴더(`train/`, `test/`, `preprocessed/`) 안에는 산출물을 쓰지 않는다.
+- 무거운 작업(EDA, 벤치마크)은 동시에 여러 개 띄우지 않는다(메모리 부족으로 강제 종료된 적 있음). `--pattern "E04_*" --max-files 3`으로 먼저 축소 실행.
+
+#### 5.2 (참고) 벤치마크 코드 리뷰 — `Benchmark.py` → `Benchmark_fixed.py`
+
+논문의 Stage 1(시계열 예측) 원본은 그대로 실행되지 않는다. 고친 것:
 
 - 모든 플롯이 `predl_NBEATS`(마지막에야 정의됨)를 그림 → `NameError`
 - 테스트 시계열 전체를 넣고 그 **끝 이후**를 예측해 실측과 겹치는 구간이 없음 → 마지막 `N_PRED`초를 홀드아웃
@@ -222,68 +253,110 @@ train/*.csv ──► .py/eda.py ──► eda_out/          (탐색, 전처리 
 - 선행 결측 bfill, 이상치 마스킹을 원-핫 **이전**에 수행, 죽은 `switch` 로직 제거
 - 논문 규칙대로 결측률 40% 초과 파일 폐기
 
-10개 모델 전체 학습은 수십 시간 규모라 축소 스모크 테스트만 시도했고, 메모리 부족으로 중단되어 **학습~평가 경로는 아직 실측 검증되지 않았다**(임포트·API 명·경로만 확인).
+10개 모델 전체 학습은 수십 시간 규모라 축소 스모크 테스트만 시도했고, 메모리 부족으로 중단되어 **학습~평가 경로는 실측 검증되지 않았다**(임포트·API 명·경로만 확인). 우리 파이프라인(1-step 이상탐지, 2절)은 이 코드를 쓰지 않는다.
 
-#### 5.2 EDA (`python .py/eda.py`, 72파일 약 40분)
+#### 5.3 1단계 — EDA (`python .py/eda.py`)
 
 산출물: `eda_out/eda_report.md`(요약), `file_summary.csv`, `error_episodes.csv`, `scm_*.csv`, `01~09_*.png`, `files/<파일>.png`
 
-핵심 발견 — 전처리·모델링 결정의 근거:
+핵심 발견 → 전처리·모델링 결정:
 
 | 발견 | 수치 | 결정 |
 |---|---|---|
 | 결측은 행 단위 block-out | E01/03/04 ~1%, gap 99%가 ≤35초, 최장 ~1h. **E02 8개 파일이 64~84%** | 40% 초과 폐기(논문), ≤60초 ffill, 긴 gap은 세그먼트 분리 |
 | c16 이상치 = 캡 드레싱 | 파일당 1~45%, 평균 11% | 센서값 carry-forward + `non_welding` 플래그 |
 | **error 컬럼은 이벤트가 아니라 상태** | E003 에피소드 중앙값 1.5~2h, 최장 28h | 에피소드 단위 집계, `error_active`/`error_share_10min` 피처 |
-| 클래스별 종료 코드가 거의 결정적 | E01→E012 18/18, E02→E016 17/18, E03→E028 18/18, E04→E029 18/18 (모두 고장 전 10분 내) | `terminal_code` 플래그, API의 `known_code_class_hint` |
+| 클래스별 종료 코드가 거의 결정적 | E01→E012 18/18, E02→E016 17/18, E03→E028 18/18, E04→E029 18/18 (모두 고장 전 10분 내) | `terminal_code` 플래그, 테스트 파일 클래스 추론, API의 `known_code_class_hint` |
 | c7·c8·c9는 파일 내 상수 | 69/72 파일 | 건 고유 속성(정적 공변량), `--drop-static` 옵션 |
 | c11·c12는 누적 카운터 | 절대값이 건마다 다름 | 증분 + 10분 롤링 합으로 대체 |
 | 수집 시기 | E02 일부는 2019-12~2020-07, 나머지는 2021-08~10 | 타임라인 확인용 `04_collection_timeline.png` |
 | 타깃 상관 | c2↔c4 +0.94, c2↔c18 +0.89, c2↔c13 −0.88 | 논문 SCM 재현(`scm_overall.csv`) |
 
-readme 2절의 "잔고장 코드를 전조 피처로" 가설은 절반만 맞다: 종료 코드는 고장 10분 전에야 나타나고, E003·E011·E029는 며칠 전부터 장시간 지속되는 상태라 단독 전조로는 약하다.
+2절의 "잔고장 코드를 전조 피처로" 가설은 절반만 맞다: 종료 코드는 고장 10분 전에야 나타나고, E003·E011·E029는 며칠 전부터 장시간 지속되는 상태라 단독 전조로는 약하다.
 
-#### 5.3 전처리 (`python .py/preprocess.py`, 약 5분)
+#### 5.4 2단계 — 전처리, 학습 파일 (`python .py/preprocess.py`)
 
-출력: `preprocessed/<파일>.parquet`(1 Hz, float32), `manifest.csv`(파일별 행·세그먼트·폐기 사유), `scaler.json`(정상행 z-score 파라미터), `preprocess_config.json`
+처리 순서(파일마다): 1 Hz 격자 정렬 → 결측률 >40% 파일 폐기 → error 코드 gap 너머로 carry → gap ≤60초 ffill, 초과 gap은 행 삭제·`segment_id` 분리(`fill_gaps()`, 서빙과 공유) → c16 규칙으로 비용접 행 센서값 blank + carry, `non_welding` 플래그 → c11/c12 → 증분·10분 롤링 → 시각 피처, `ttf_s`, `label` → 정상행(`label==0 & error_active==0`)으로 z-score fit(글로벌) → 저장.
 
-컬럼: `file, class, gun, segment_id` · 센서 `c1~c9, c13~c19`(z-score), `c10`(0/1) · 파생 `welds_delta, pos_delta, welds_10min, weld_duty_10min, error_share_10min, hour_sin, hour_cos, dow` · 상태 `error_code, error_active, terminal_code, non_welding` · 레이블 `ttf_s`(고장까지 초), `label`(마지막 3600초=1)
+출력 `preprocessed/`:
 
-주요 옵션: `--max-missing-rate 0.4`, `--gap-fill-limit 60`, `--pre-failure-window 3600`, `--resample 10s`, `--scale global|per-file|none`, `--drop-static`
+| 파일 | 내용 |
+|---|---|
+| `<파일>.parquet` | 1 Hz, float32. `file, class, gun, segment_id` · 센서 `c1~c9, c13~c19`(z-score), `c10`(0/1) · 파생 `welds_delta, pos_delta, welds_10min, weld_duty_10min, error_share_10min, hour_sin, hour_cos, dow` · 상태 `error_code, error_active, terminal_code, non_welding` · 레이블 `ttf_s`, `label`(마지막 3600초=1) |
+| `manifest.csv` | 파일별 행·세그먼트·결측률·비용접 비율·폐기 사유·`class_source` |
+| `scaler.json` | 스케일 컬럼별 mean/std (3단계·서빙이 읽음) |
+| `preprocess_config.json` | 사용한 옵션 (3단계·4단계 번들이 읽음) |
 
-결과: 64/72 파일, 37.6M행. 스케일러는 `label==0 & error_active==0` 행으로만 fit.
+주요 옵션: `--max-missing-rate 0.4`, `--gap-fill-limit 60`, `--pre-failure-window 3600`, `--resample 10s`, `--scale global|per-file|none`, `--drop-static`. `per-file`·`--resample`은 실험용이다 — 서빙이 재현할 수 없어 그 번들은 API가 기동을 거부한다.
 
-#### 5.4 이상탐지 베이스라인 (`python .py/train.py`)
+결과(2026-09-23): 64/72 파일, 37.5M행, 1,047 세그먼트. 폐기 8개는 모두 E02(결측 64~84%).
 
-- 60초 윈도우로 집계(연속 피처 24개 × mean/std = 48 피처, ~60만 윈도우), **파일(=건) 단위** 층화 분할 25% 검증
-- IsolationForest(300 trees), 정상 윈도우(`label==0 & error_active==0`) 464,816개로 학습
-- 임계값 = 학습 정상 점수의 99% 분위수(0.5406)
+#### 5.5 3단계 — 전처리, 테스트 파일 (`python .py/preprocess.py --split test`)
 
-검증(16개 건, 고장 전 1h vs 정상):
+같은 코드 경로를 타되 세 가지가 다르다.
+
+- 명시하지 않은 옵션은 2단계의 `preprocess_config.json`에서 가져온다. z-score는 `scaler.json`을 적용만 하고 **재적합하지 않는다**.
+- 파일명(`test_N`)에 클래스가 없으므로 마지막 10분의 종료 코드로 추론해 `class`에 넣고, 근거를 `manifest.csv`의 `class_source`에 남긴다(여러 코드가 있으면 고장에 가장 가까운 것: test_3은 E016→E029라 E04).
+- 출력은 `preprocessed/test/`. 2단계 산출물을 덮어쓰지 않고 `scaler.json`도 쓰지 않는다.
+
+결과: 8/8 유지, 4.83M행. 추론 클래스 E01×2(test_0,1), E02×1(test_2), E03×2(test_4,5), E04×3(test_3,6,7). test_2·test_3은 행의 87~95%가 `non_welding`이라 학습 최대치(45%)를 크게 넘는다(5.10절 참고).
+
+#### 5.6 4단계 — 학습·평가 (`python .py/train.py`)
+
+- 세그먼트 안에서 60초 윈도우 집계(연속 피처 24개 × mean/std = 48 피처, 학습 ~60만 윈도우)
+- **파일(=건) 단위** 클래스별 층화 분할, 25% 검증(14개 건)
+- IsolationForest(300 trees), 정상 윈도우(`label==0 & error_active==0`) 464,395개로 학습
+- 임계값 = 학습 정상 점수의 99% 분위수(0.5411, 오탐률 1% 설계). `sustain=3` 연속 초과 = 지속 알람
+- 평가 = AUROC/AUPRC(고장 전 1h vs 정상), 정상 알람률, 클래스별, 파일별 "고장으로 이어지는 마지막 알람 구간 시작 시각"과 "24h 이전 오탐 에피소드/일"
+- 검증 후 `preprocessed/test/`가 있으면 **같은 임계값으로 테스트도 자동 평가**해 `metrics["test"]`에 넣는다(`--no-test`로 생략)
+
+검증(14개 건):
 
 | | AUROC | recall@1h | 정상 알람률 |
 |---|---|---|---|
-| 전체 | 0.639 | 0.051 | 0.015 |
-| E01 | 0.687 | 0.016 | 0.001 |
-| E02 | 0.789 | 0.298 | 0.058 |
-| E03 | 0.633 | 0.004 | 0.018 |
-| E04 | 0.589 | 0.008 | 0.004 |
+| 전체 | 0.630 | 0.044 | 0.014 |
+| E01 | 0.675 | 0.016 | 0.008 |
+| E02 | 0.821 | 0.278 | 0.043 |
+| E03 | 0.630 | 0.000 | 0.018 |
+| E04 | 0.575 | 0.008 | 0.003 |
 
-→ 오탐률은 설계대로 1%대지만 **고장 전 1시간을 거의 못 잡는다**. 기준선일 뿐이다.
+테스트(8개 건, 클래스는 추론값):
 
-저장: `models/baseline_iforest.joblib` = `{model, feature_cols, model_cols, window, threshold, sustain, scaler, feature_reference, metrics, train/val_files}`. 추론은 `from train import load_bundle, score_frame` 또는 `python .py/train.py --score preprocessed/E04_3.parquet`.
+| | AUROC | recall@1h | 정상 알람률 |
+|---|---|---|---|
+| 전체 | 0.687 | 0.054 | 0.032 |
+| E01 (2) | 0.452 | 0.000 | 0.002 |
+| E02 (1) | 0.800 | 0.167 | 0.110 |
+| E03 (2) | 0.887 | 0.017 | 0.000 |
+| E04 (3) | 0.678 | 0.077 | 0.044 |
 
-#### 5.5 실시간 추론 API (`uvicorn main:app --reload`)
+→ 오탐률은 설계대로 1%대지만 **고장 전 1시간을 거의 못 잡는다**. 종료 상태(E029 등)도 임계값 아래로 본다. 기준선일 뿐이다.
+
+산출물 `models/`:
+
+| 파일 | 내용 |
+|---|---|
+| `baseline_iforest.joblib` | `{model, feature_cols, model_cols, window, threshold, sustain, scaler, preprocess_config, feature_reference, feature_scale, metrics, train_files, val_files, args, created}` — 서빙에 필요한 것이 전부 들어 있다 |
+| `baseline_iforest_metrics.json` | 위에서 `model`만 뺀 것 |
+| `baseline_iforest_test_metrics.json` | `--evaluate` 결과 |
+| `scores/test_N_iforest.csv` | `--evaluate`가 쓰는 파일별 윈도우 점수(`score, alarm, ttf_s, label, error_active, non_welding`) |
+
+다른 진입점: `--evaluate`(학습 없이 저장 번들로 테스트만), `--score <parquet>`(파일 하나 스코어링 → `models/scores/`), `--model pca`, `--window 120`, `--exclude-non-welding`, `--max-files 8`(빠른 확인). 코드에서는 `from train import load_bundle, score_frame`.
+
+#### 5.7 5단계 — 실시간 추론 API (`uvicorn main:app --reload`)
+
+`main.py`는 `sys.path`에 `.py/`를 넣어 `train`·`preprocess`를 import하고, `RSW_MODEL_PATH`(기본 `models/baseline_iforest.joblib`)의 번들을 기동 시 로드한다. 번들에 든 `scaler`와 `preprocess_config`(gap 한도, c16 임계)로 전처리를 온라인으로 재현하므로 클라이언트는 아무 전처리도 하지 않는다.
 
 | 메서드 | 경로 | 역할 |
 |---|---|---|
 | POST | `/predict` | `{gun_id, readings:[SensorReading]}` → 건별 30분 버퍼에 추가, 최신 60초 윈도우 스코어링. 60초 미만이면 `202 warming_up` |
-| GET | `/model`, `/health`, `/guns` | 모델 카드 / 상태 / 건별 버퍼·연속 알람 |
-| DELETE | `/guns/{gun_id}` | 버퍼 리셋 |
+| GET | `/model` | 모델 카드: 윈도우·임계값·피처·전처리 파라미터·검증/테스트 지표·파일 목록 |
+| GET | `/health`, `/guns` | 상태 / 건별 버퍼·연속 알람 |
+| DELETE | `/guns/{gun_id}` | 버퍼 리셋(정비 후) |
 
-입력 `SensorReading`은 CSV 컬럼 그대로(`time, c1~c19, error`; `c10`은 on/off·bool 허용, `error`는 `^(0|E\d{3})$`). 서버가 전처리를 온라인으로 동일 적용한다.
+입력 `SensorReading` = CSV 컬럼 그대로(`time, c1~c19, error`; `c10`은 on/off·bool 허용, `error`는 `^(0|E\d{3})$`).
 
-출력 `AnomalyResult`(온톨로지 단계 입력):
+출력 `AnomalyResult` — 온톨로지 단계와의 **계약**(필드 삭제·의미 변경 금지, 추가는 자유):
 
 ```json
 {"gun_id": "G0", "status": "ok", "window_start": "...", "window_end": "...", "n_samples": 60, "history_s": 1809,
@@ -293,17 +366,35 @@ readme 2절의 "잔고장 코드를 전조 피처로" 가설은 절반만 맞다
                             "statistic": "mean", "value": -3.1, "reference": 0.02, "contribution": 0.08, "share": 0.41}],
  "context": {"latest_error_code": "E029", "error_active_share": 1.0, "non_welding_share": 0.0,
              "welds_in_window": 0, "welds_10min": 12, "weld_duty_10min": 0.02, "known_code_class_hint": "E04"},
- "model": {"name": "baseline_iforest", "type": "iforest", "window_s": 60, "threshold": 0.54, "sustain": 3, "n_features": 48}}
+ "model": {"name": "baseline_iforest", "type": "iforest", "created": "...", "window_s": 60, "threshold": 0.54,
+           "threshold_q": 0.99, "sustain": 3, "n_features": 48}}
 ```
 
 - `severity`: `normal`(임계 미만) / `warning`(초과) / `critical`(`sustain`=3회 연속 초과) — 3절의 "연속 N회일 때만 RAG 트리거" 기준
-- `contributing_features`: 각 피처를 정상 기준값으로 치환했을 때 점수 감소량(모델 무관), 상위 8개
-- 요청당 ~60 ms(1,100행 append 포함)
+- `contributing_features`: 피처 하나를 정상 기준값(`feature_reference`)으로 치환했을 때의 점수 감소량, 상위 8개. 모델 무관 방식
+- `known_code_class_hint`: 최신 error 코드가 종료 코드면 그 클래스. 모델과 무관한 안전장치
+- 요청당 ~40 ms. 실데이터 검증: test_3 마지막 30분을 300행씩 보내면 마지막 윈도우의 API 점수가 오프라인 parquet에서 계산한 점수와 일치(0.5808)
+- `per-file` 스케일·`--resample` 번들은 기동 시 `RuntimeError`
 
-#### 5.6 현재 한계와 다음 단계
+#### 5.8 품질 관리
 
-1. 현재 `models/baseline_iforest.joblib`은 `feature_reference` 추가 **이전**에 학습된 것이라 API의 기여도 기준값이 0으로 대체된다 → `python .py/train.py` 재학습 필요.
-2. 베이스라인은 종료 상태(E029 등)조차 임계값 아래로 본다. 시도할 것: `preprocess.py --scale per-file --drop-static`(건 간 오프셋 제거), 윈도우 길이 확대, 시퀀스 모델(LSTM-AE 등), 그리고 `label`을 쓰는 지도학습 비교.
-3. E01_0은 고장 직전 1시간의 85%가 `non_welding` — 고장이 정비 중 발생하는 패턴인지 72파일에서 확인해야 하며, 그렇다면 `non_welding`을 입력에서 빼야 모델이 플래그만 외우지 않는다.
+- `pytest` → `tests/test_pipeline.py`: 합성 CSV(클래스별 2파일 + 테스트 2파일, 2시간, gap·캡 드레싱·종료 코드 포함)를 임시 폴더에서 2→3→4→4'→`--score`→5단계(`/predict`)까지 돌리고, API 점수가 오프라인 점수와 같은지 확인한다. 실데이터 폴더는 건드리지 않는다. 파이프라인 코드를 고치면 이것부터 돌린다.
+- `ruff check .` 통과 상태. `black .`은 `pyproject.toml` 설정(120자)을 따른다.
+- 실데이터 파이프라인을 다시 돌려야 하는 변경: 전처리 규칙(2단계 코드) → 2·3·4단계 전부. 모델·윈도우만 → 4단계. 서빙만 → 재실행 불필요(`pytest`로 확인).
+
+#### 5.9 진행 이력
+
+| 날짜 | 내용 |
+|---|---|
+| 09-17 ~ 09-18 | 논문 리뷰, 데이터 확보, 원본 CSV 점검(`file_check.py`, `error_check.py`), 접근 방식 결정(1-step 이상탐지, 2절) |
+| 09-22 | 벤치마크 코드 리뷰·수정(5.2), EDA(5.3), 전처리(5.4), IsolationForest 베이스라인(5.6), FastAPI 서빙(5.7), `MEMORY.md` 작성 |
+| 09-23 | 테스트 8파일 전처리·평가 추가(5.5, 5.6). 파이프라인 점검: gap 채움 버그(ffill+bfill로 120초까지 메꿔짐) 수정 후 전처리·재학습, 번들에 전처리 설정 포함·서빙이 읽도록 변경, E2E 스모크 테스트·`requirements.txt`·`pyproject.toml` 추가 |
+
+#### 5.10 현재 한계와 다음 단계
+
+1. 베이스라인은 종료 상태(E029 등)조차 임계값 아래로 본다. 시도할 것: `--scale per-file --drop-static`(건 간 오프셋 제거 — 단 서빙용 스케일 전략을 같이 정해야 함), 윈도우 확대(5~10분), 시퀀스 모델(LSTM-AE 등), `label`을 쓰는 지도학습 비교.
+2. E01_0은 고장 직전 1시간의 85%가 `non_welding` — 고장이 정비 중 발생하는 패턴인지 72파일에서 확인해야 하며, 그렇다면 `non_welding`을 입력에서 빼야 모델이 플래그만 외우지 않는다.
+3. test_2·test_3은 행의 87~95%가 `non_welding`(학습 최대 45%) — 이 두 건에서 c16 규칙이 "캡 드레싱"이 맞는지 c16 분포를 확인해야 한다. 테스트 E02·E04 지표와 오탐(하루 7~10회 지속 알람)은 여기서 나온다.
 4. 서빙 윈도우는 트레일링 60초, 학습 윈도우는 분 경계 정렬 — 정확히 맞추려면 서빙도 분 경계로 자른다.
 5. `Benchmark_fixed.py`의 실제 학습 경로는 미검증.
+6. 3절의 하류(온톨로지/RAG 원인 분석, LLM 리포트, Slack)는 미구현. 입력 계약은 5.7의 `AnomalyResult`.

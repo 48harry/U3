@@ -18,8 +18,13 @@ Eval  : on validation files - AUROC / AUPRC of pre-failure vs normal windows, pe
         alarm rate on normal windows, recall on pre-failure windows, and per file: how many
         hours before failure the final alarm run (--sustain consecutive windows, reaching the
         failure) starts, and the number of sustained false-alarm runs per day > 24 h earlier.
+Test  : the 8 held-out files (preprocess.py --split test -> preprocessed/test/) get the same
+        evaluation, with the SAME threshold, after training (metrics["test"]) or on their own
+        with --evaluate (loads the saved bundle, writes models/baseline_<model>_test_metrics.json
+        and per-file scores to models/scores/). Their class is the one preprocess.py inferred
+        from the terminal code, so per-class numbers on test are "by inferred class".
 Save  : models/baseline_<model>.joblib - a dict with the fitted model, feature list, window,
-        threshold, the scaler from preprocess and the metrics. Inference:
+        threshold, the scaler + preprocess config from preprocess.py and the metrics. Inference:
 
             from train import load_bundle, score_frame
             b = load_bundle("models/baseline_iforest.joblib")
@@ -28,7 +33,8 @@ Save  : models/baseline_<model>.joblib - a dict with the fitted model, feature l
         or  python train.py --score preprocessed/E04_3.parquet
 
 Usage:
-    python train.py                              # iforest, 60 s windows
+    python train.py                              # iforest, 60 s windows, then val + test evaluation
+    python train.py --evaluate                   # test evaluation only, with the saved bundle
     python train.py --model pca --window 120
     python train.py --max-files 8                # quick check
 """
@@ -162,6 +168,42 @@ def evaluate(val, scores, threshold, sustain):
     return m
 
 
+def print_metrics(tag, v):
+    print(f"{tag}: AUROC {v['auroc']:.3f}  AUPRC {v['auprc']:.3f}  alarm@normal {v['alarm_rate_normal']:.3f}  "
+          f"recall@pre-failure {v['recall_pre_failure']:.3f}  ({v['n_windows']:,} windows)")
+    for k, r in v["per_class"].items():
+        print(f"  {k}: AUROC {r['auroc']:.3f}  recall {r['recall_pre_failure']:.3f}  alarm@normal {r['alarm_rate_normal']:.3f}")
+
+
+def test_files_in(test_dir):
+    return sorted(glob.glob(os.path.join(test_dir, "test_*.parquet")))
+
+
+def evaluate_test(model, feat_cols, model_cols, window, threshold, sustain, files, score_dir=None, tag=""):
+    """Window + score the preprocessed test files with the frozen model/threshold and run the same
+    evaluation as for validation. Optionally writes per-file score CSVs (time, score, alarm, ...)."""
+    ws = []
+    for i, f in enumerate(files, 1):
+        df = pd.read_parquet(f)
+        w = window_features(df, window, feat_cols)
+        ws.append(w)
+        print(f"[test {i}/{len(files)}] {os.path.basename(f)} (class {df['class'].iloc[0]}): "
+              f"{len(df):,} rows -> {len(w):,} windows", flush=True)
+    test_w = pd.concat(ws)
+    scores = anomaly_score(model, test_w[model_cols].to_numpy(dtype=np.float32))
+    m = evaluate(test_w, scores, threshold, sustain)
+    m["files"] = [os.path.basename(f) for f in files]
+    m["file_class"] = {f: str(c) for f, c in test_w.groupby("file")["class"].first().items()}
+    m["class_source"] = "inferred by preprocess.py from the terminal code in the last 10 min"
+    if score_dir:
+        os.makedirs(score_dir, exist_ok=True)
+        test_w = test_w.assign(score=scores, alarm=scores > threshold)
+        for f, part in test_w.groupby("file"):
+            cols = ["score", "alarm"] + [c for c in ("ttf_s", "label", "error_active", "non_welding") if c in part.columns]
+            part[cols].to_csv(os.path.join(score_dir, f"{f}_{tag}.csv"))
+    return m
+
+
 # ------------------------------------------------------------- inference
 def load_bundle(path):
     return joblib.load(path)
@@ -195,6 +237,10 @@ def split_files(files, val_frac, seed):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default=os.path.join(PROJECT_ROOT, "preprocessed"))
+    ap.add_argument("--test-dir", default=None, help="preprocessed test files; default <data-dir>/test. "
+                    "Evaluated after training when present; pass --no-test to skip")
+    ap.add_argument("--no-test", action="store_true")
+    ap.add_argument("--evaluate", action="store_true", help="skip training; evaluate the saved bundle on --test-dir")
     ap.add_argument("--model-dir", default=os.path.join(PROJECT_ROOT, "models"))
     ap.add_argument("--model", choices=["iforest", "pca"], default="iforest")
     ap.add_argument("--window", type=int, default=60, help="window length in seconds")
@@ -216,6 +262,28 @@ def main():
         dst = os.path.join(args.model_dir, "scores", f"{stem}_{args.model}.csv")
         out.to_csv(dst)
         print(f"{len(out)} windows, alarm rate {out['alarm'].mean():.3f}, threshold {b['threshold']:.4f} -> {dst}")
+        return
+
+    test_dir = args.test_dir or os.path.join(args.data_dir, "test")
+    test_files = [] if args.no_test else test_files_in(test_dir)
+    if args.evaluate:
+        if not test_files:
+            raise SystemExit(f"no test_*.parquet in {test_dir} - run preprocess.py --split test first")
+        bundle_path = os.path.join(args.model_dir, f"baseline_{args.model}.joblib")
+        if not os.path.exists(bundle_path):
+            raise SystemExit(f"{bundle_path} not found - train first")
+        b = load_bundle(bundle_path)
+        print(f"evaluating {bundle_path} (window {b['window']}s, threshold {b['threshold']:.4f}, "
+              f"sustain {b['sustain']}) on {len(test_files)} test files")
+        m = evaluate_test(b["model"], b["feature_cols"], b["model_cols"], b["window"], b["threshold"],
+                          b["sustain"], test_files, os.path.join(args.model_dir, "scores"), args.model)
+        print_metrics("test", m)
+        dst = os.path.join(args.model_dir, f"baseline_{args.model}_test_metrics.json")
+        with open(dst, "w", encoding="utf-8") as f:
+            json.dump({"bundle": bundle_path, "created": b.get("created"), "threshold": b["threshold"],
+                       "window": b["window"], "sustain": b["sustain"], "test": m,
+                       "evaluated": dt.datetime.now().isoformat(timespec="seconds")}, f, indent=2, default=str)
+        print(f"saved {dst}")
         return
 
     files = sorted(glob.glob(os.path.join(args.data_dir, "E0*.parquet")))
@@ -256,14 +324,16 @@ def main():
     if val_w is not None:
         val_scores = anomaly_score(model, val_w[model_cols].to_numpy(dtype=np.float32))
         metrics["val"] = evaluate(val_w, val_scores, threshold, args.sustain)
-        v = metrics["val"]
-        print(f"val: AUROC {v['auroc']:.3f}  AUPRC {v['auprc']:.3f}  alarm@normal {v['alarm_rate_normal']:.3f}  "
-              f"recall@pre-failure {v['recall_pre_failure']:.3f}")
-        for k, r in v["per_class"].items():
-            print(f"  {k}: AUROC {r['auroc']:.3f}  recall {r['recall_pre_failure']:.3f}  alarm@normal {r['alarm_rate_normal']:.3f}")
+        print_metrics("val", metrics["val"])
+    if test_files:
+        metrics["test"] = evaluate_test(model, feat_cols, model_cols, args.window, threshold, args.sustain, test_files)
+        print_metrics("test", metrics["test"])
+    else:
+        print(f"no test files in {test_dir} - skipped test evaluation")
 
     os.makedirs(args.model_dir, exist_ok=True)
     scaler_path = os.path.join(args.data_dir, "scaler.json")
+    config_path = os.path.join(args.data_dir, "preprocess_config.json")
     bundle = {
         "model": model, "model_type": args.model, "feature_cols": feat_cols, "model_cols": model_cols,
         "window": args.window, "threshold": threshold, "threshold_q": args.threshold_q, "sustain": args.sustain,
@@ -272,6 +342,8 @@ def main():
         "feature_reference": np.median(X, axis=0).astype(float).tolist(),
         "feature_scale": X.std(axis=0).astype(float).tolist(),
         "scaler": json.load(open(scaler_path, encoding="utf-8")) if os.path.exists(scaler_path) else None,
+        # the serving layer reproduces the preprocessing online from these (gap limit, c16 rule, resample)
+        "preprocess_config": json.load(open(config_path, encoding="utf-8")) if os.path.exists(config_path) else None,
         "train_files": [os.path.basename(f) for f in train_files],
         "val_files": [os.path.basename(f) for f in val_files],
         "metrics": metrics, "args": vars(args), "created": dt.datetime.now().isoformat(timespec="seconds"),

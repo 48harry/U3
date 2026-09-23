@@ -28,6 +28,14 @@ Every rule below comes from eda_out/ (72 files) and the paper's pre-processing s
   scaling     z-score (paper) fitted on normal rows, global across files (--scale global) or
               per file (--scale per-file, removes gun-level offsets). Parameters are written
               to scaler.json so test files get the identical transform.
+  test split  --split test runs the SAME pipeline on test/test_N.csv: every option the user does
+              not pass explicitly is taken from the train run's preprocess_config.json, the
+              global scaler is loaded from scaler.json instead of being fitted, and the output
+              goes to <train out-dir>/test/. Test files carry no class in the name, so the class
+              is inferred from the terminal code seen in the last 10 min (E012 E01, E016 E02,
+              E028 E03, E029 E04 - near-deterministic in the train set); the manifest records
+              the source (`class_source`). ttf_s / label are computed the same way (each test
+              file ends at its failure, like the train files).
 
 Outputs (in --out-dir):
   <file>.parquet (or .csv)   one row per second (or per --resample bin), float32
@@ -37,6 +45,7 @@ Outputs (in --out-dir):
 
 Usage:
     python preprocess.py                         # ./train -> ./preprocessed
+    python preprocess.py --split test            # ./test  -> ./preprocessed/test (train config + scaler)
     python preprocess.py --resample 10s          # 10-second bins (mean of sensors, max of flags)
     python preprocess.py --scale per-file --drop-static
     python preprocess.py --pattern "E04_*" --max-files 3     # quick check
@@ -60,11 +69,15 @@ BINARY_COL = "c10"
 VALUE_COLS = [c for c in SENSOR_COLS if c not in COUNTER_COLS + [BINARY_COL]]
 CLASSES = ["E01", "E02", "E03", "E04"]
 TERMINAL_CODE = {"E01": "E012", "E02": "E016", "E03": "E028", "E04": "E029"}
+TERMINAL_TO_CLASS = {v: k for k, v in TERMINAL_CODE.items()}
 ROLL = "600s"  # 10-minute rolling window for activity / error-share features
 
 FLAG_COLS = ["error_active", "terminal_code", "non_welding", "label"]
 # derived continuous columns that get z-scored; the 10-min shares are already in [0, 1] and stay raw
 DERIVED_CONT = ["welds_delta", "welds_10min", "pos_delta"]
+# options the test split inherits from the train run unless passed explicitly
+INHERITED_OPTIONS = ["max_missing_rate", "gap_fill_limit", "outlier_hi", "outlier_lo", "pre_failure_window",
+                     "resample", "scale", "drop_static", "format"]
 
 
 # ------------------------------------------------------------------- loading
@@ -81,34 +94,63 @@ def load_file(path):
     return df, present
 
 
+def fill_gaps(x, present, limit):
+    """Gap handling shared with main.py. A gap = run of missing 1 Hz rows. Gaps up to `limit` seconds
+    are forward-filled; the rows of longer gaps are dropped, which starts a new segment downstream.
+    (ffill + bfill with the same limit - the old code - silently bridged gaps up to 2 * limit.)
+    Rows that still hold a NaN sensor value afterwards are dropped as well."""
+    present = pd.Series(np.asarray(present, dtype=bool), index=x.index)
+    run = (present != present.shift()).cumsum()
+    gap_len = (~present).groupby(run).transform("size").where(~present, 0)
+    x = x[gap_len <= limit].ffill(limit=limit)
+    return x[x.notna().all(axis=1)]
+
+
 # -------------------------------------------------------------- per file
+def infer_class(code, t_end, tail_s=600):
+    """test_N files carry no class in the name. The class-specific terminal codes show up inside the
+    last 10 min before failure in 71/72 train files (MEMORY.md 2), so the last one seen there names
+    the class. Returns (class, source) with class == "unknown" when none is present."""
+    tail = code[code.index > t_end - pd.Timedelta(seconds=tail_s)]
+    hits = tail[tail.isin(TERMINAL_TO_CLASS)]
+    if hits.empty:
+        return "unknown", "no terminal code in the last 10 min"
+    last = hits.iloc[-1]
+    return TERMINAL_TO_CLASS[last], f"terminal code {last}"
+
+
 def preprocess_file(path, args):
     name = os.path.splitext(os.path.basename(path))[0]
-    cls, gun = name.split("_")
+    prefix, gun = name.split("_")
     df, present = load_file(path)
     missing_rate = 1 - present.mean()
-    if missing_rate > args.max_missing_rate:
-        return None, {"file": name, "class": cls, "gun": int(gun), "rows": 0, "segments": 0,
-                      "missing_rate": missing_rate, "dropped": f"missing rate {missing_rate:.0%}"}
     t_end = df.index[-1]
 
     # --- error state: carry the code across gaps, then flags
     code = df["error"].where(present).ffill().fillna("0").astype(str)
+    if prefix in CLASSES:  # E0x_N (train)
+        cls, class_source = prefix, "filename"
+    else:  # test_N
+        cls, class_source = infer_class(code, t_end)
+    base = {"file": name, "class": cls, "class_source": class_source, "gun": int(gun),
+            "rows": 0, "segments": 0, "missing_rate": missing_rate}
+    if missing_rate > args.max_missing_rate:
+        return None, {**base, "dropped": f"missing rate {missing_rate:.0%}"}
+
     out = pd.DataFrame(index=df.index)
     out["error_code"] = code
     out["error_active"] = (code != "0").astype("float32")
-    out["terminal_code"] = (code == TERMINAL_CODE[cls]).astype("float32")
+    terminal = [TERMINAL_CODE[cls]] if cls in TERMINAL_CODE else list(TERMINAL_CODE.values())
+    out["terminal_code"] = code.isin(terminal).astype("float32")
 
     # --- sensors: c10 -> 0/1, non-welding rows blanked (paper outlier rule), then gap fill
     x = df[SENSOR_COLS].copy()
     x[BINARY_COL] = (x[BINARY_COL] == "on").astype("float32").where(present)
-    # 1) gaps: fill up to the limit, drop what is left (long block-outs)
-    x = x.ffill(limit=args.gap_fill_limit).bfill(limit=args.gap_fill_limit)
-    keep = x.notna().all(axis=1)
-    x, out = x[keep], out[keep]
+    # 1) gaps: fill up to the limit, drop the rows of longer gaps (long block-outs)
+    x = fill_gaps(x, present, args.gap_fill_limit)
+    out = out.loc[x.index]
     if len(x) == 0:
-        return None, {"file": name, "class": cls, "gun": int(gun), "rows": 0, "segments": 0,
-                      "missing_rate": missing_rate, "dropped": "no rows left after gap filtering"}
+        return None, {**base, "dropped": "no rows left after gap filtering"}
     # 2) non-welding rows (cap dressing / changing): blank the sensors and carry the last
     #    welding value across, however long the block is (paper). Rows stay, flagged.
     non_welding = (x["c16"] > args.outlier_hi) | (x["c16"] <= args.outlier_lo)
@@ -147,8 +189,7 @@ def preprocess_file(path, args):
     out.insert(0, "gun", np.int16(gun))
     out.insert(0, "class", cls)
     out.insert(0, "file", name)
-    info = {"file": name, "class": cls, "gun": int(gun), "rows": len(out),
-            "segments": int(out["segment_id"].nunique()), "missing_rate": missing_rate,
+    info = {**base, "rows": len(out), "segments": int(out["segment_id"].nunique()),
             "non_welding_share": float(out["non_welding"].mean()), "label_rows": int(out["label"].sum()),
             "start": out.index[0], "end": out.index[-1], "dropped": ""}
     return out, info
@@ -220,10 +261,40 @@ def reader(fmt):
     return lambda p: pd.read_csv(p + ".csv", index_col=0, parse_dates=True)
 
 
+def inherit_train_config(ap, args):
+    """Test files must get exactly the train transform: every inherited option the user did not
+    pass explicitly is read from the train run's preprocess_config.json."""
+    p = os.path.join(args.train_out_dir, "preprocess_config.json")
+    if not os.path.exists(p):
+        raise SystemExit(f"{p} not found - run the train split first (python preprocess.py)")
+    with open(p, encoding="utf-8") as f:
+        cfg = json.load(f)
+    for k in INHERITED_OPTIONS:
+        if k in cfg and getattr(args, k) == ap.get_default(k):
+            setattr(args, k, cfg[k])
+    return p
+
+
+def load_train_scaler(args):
+    p = os.path.join(args.train_out_dir, "scaler.json")
+    if not os.path.exists(p):
+        raise SystemExit(f"{p} not found - run the train split first (python preprocess.py)")
+    with open(p, encoding="utf-8") as f:
+        sc = json.load(f)
+    if sc["scale"] != "global":
+        raise SystemExit(f"train scaler is '{sc['scale']}', cannot apply it to the test split - pass --scale {sc['scale']}")
+    return sc
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train-dir", default=os.path.join(PROJECT_ROOT, "train"))
-    ap.add_argument("--out-dir", default=os.path.join(PROJECT_ROOT, "preprocessed"))
+    ap.add_argument("--split", choices=["train", "test"], default="train",
+                    help="test: ./test -> <train-out-dir>/test with the train config and scaler")
+    ap.add_argument("--input-dir", "--train-dir", dest="input_dir", default=None,
+                    help="CSV folder; default ./train or ./test by --split")
+    ap.add_argument("--out-dir", default=None, help="default ./preprocessed (train) or ./preprocessed/test")
+    ap.add_argument("--train-out-dir", default=os.path.join(PROJECT_ROOT, "preprocessed"),
+                    help="test split: where the train run wrote scaler.json / preprocess_config.json")
     ap.add_argument("--pattern", default="*.csv")
     ap.add_argument("--max-files", type=int, default=None)
     ap.add_argument("--max-missing-rate", type=float, default=0.40, help="paper: discard guns above this")
@@ -236,17 +307,30 @@ def main():
     ap.add_argument("--drop-static", action="store_true", help="drop c7/c8/c9 (constant per gun)")
     ap.add_argument("--format", choices=["parquet", "csv"], default="parquet")
     args = ap.parse_args()
+    is_test = args.split == "test"
+    config_source, train_scaler = None, None
+    if is_test:
+        config_source = inherit_train_config(ap, args)
+        if args.scale == "global":
+            train_scaler = load_train_scaler(args)
+    args.input_dir = args.input_dir or os.path.join(PROJECT_ROOT, args.split)
+    args.out_dir = args.out_dir or (os.path.join(args.train_out_dir, "test") if is_test else args.train_out_dir)
 
-    paths = sorted(glob.glob(os.path.join(args.train_dir, args.pattern)))[: args.max_files]
+    paths = sorted(glob.glob(os.path.join(args.input_dir, args.pattern)))[: args.max_files]
     if not paths:
-        raise SystemExit(f"no files matching {args.pattern!r} in {os.path.abspath(args.train_dir)} — pass --train-dir")
+        raise SystemExit(f"no files matching {args.pattern!r} in {os.path.abspath(args.input_dir)} - pass --input-dir")
     os.makedirs(args.out_dir, exist_ok=True)
     fmt, write = writer(args.format)
     read = reader(fmt)
 
     scale_cols = [c for c in VALUE_COLS if not (args.drop_static and c in STATIC_COLS)] + DERIVED_CONT
+    if train_scaler and train_scaler["columns"] != scale_cols:
+        raise SystemExit(f"scaler columns {train_scaler['columns']} != {scale_cols} - check --drop-static")
     stats = StreamingStats(scale_cols)
     manifest, t0 = [], time.time()
+    if is_test:
+        print(f"test split: options from {config_source}, scale={args.scale}"
+              + (f", scaler from {os.path.join(args.train_out_dir, 'scaler.json')}" if train_scaler else ""))
 
     # pass 1: clean, derive, write; accumulate global scaler stats on normal rows
     for i, p in enumerate(paths, 1):
@@ -256,17 +340,21 @@ def main():
         if out is None:
             print("  dropped:", info["dropped"])
             continue
+        if info.get("class_source") != "filename":
+            print(f"  class {info['class']} ({info['class_source']})")
         if args.scale == "per-file":
             local = StreamingStats(scale_cols)
             local.add(normal_rows(out))
             out = apply_scaler(out, local.params())
+        elif args.scale == "global" and is_test:
+            out = apply_scaler(out, train_scaler["params"])  # never refit on test data
         elif args.scale == "global":
             stats.add(normal_rows(out))
         write(out, os.path.join(args.out_dir, info["file"]))
 
-    # pass 2: apply the global scaler
+    # pass 2: apply the global scaler (train split only; test files were scaled on the way in)
     params = {}
-    if args.scale == "global" and stats.n > 0:
+    if args.scale == "global" and not is_test and stats.n > 0:
         params = stats.params()
         for info in manifest:
             if info["dropped"]:
@@ -277,10 +365,15 @@ def main():
         params = {"note": "per-file z-score; fit the same way on each test file (normal rows)"}
 
     pd.DataFrame(manifest).to_csv(os.path.join(args.out_dir, "manifest.csv"), index=False)
-    with open(os.path.join(args.out_dir, "scaler.json"), "w", encoding="utf-8") as f:
-        json.dump({"scale": args.scale, "columns": scale_cols, "params": params, "n_fit_rows": stats.n}, f, indent=2)
+    if not is_test:  # the scaler belongs to the train run; the test split only reads it
+        with open(os.path.join(args.out_dir, "scaler.json"), "w", encoding="utf-8") as f:
+            json.dump({"scale": args.scale, "columns": scale_cols, "params": params, "n_fit_rows": stats.n}, f, indent=2)
+    cfg = vars(args)
+    if is_test:
+        cfg = {**cfg, "config_source": config_source,
+               "scaler_source": os.path.join(args.train_out_dir, "scaler.json") if train_scaler else None}
     with open(os.path.join(args.out_dir, "preprocess_config.json"), "w", encoding="utf-8") as f:
-        json.dump(vars(args), f, indent=2)
+        json.dump(cfg, f, indent=2)
 
     m = pd.DataFrame(manifest)
     kept = m[m["dropped"] == ""]

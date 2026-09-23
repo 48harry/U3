@@ -1,9 +1,12 @@
-import pandas as pd
 import glob
 import os
 
+import pandas as pd
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .py/ -> repo root
+
 # 1. 파일 경로 설정 (유저 환경에 맞게 폴더 경로를 수정해 주세요)
-folder_paths = ["./train", "./test"]
+folder_paths = [os.path.join(PROJECT_ROOT, "train"), os.path.join(PROJECT_ROOT, "test")]
 all_files = []
 
 for folder in folder_paths:

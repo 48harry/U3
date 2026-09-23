@@ -10,7 +10,7 @@ online, scores the trailing window and returns a JSON document for the ontology 
 
 Endpoints
     GET  /health                  liveness + model status
-    GET  /model                   model card (window, threshold, features, validation metrics)
+    GET  /model                   model card (window, threshold, features, preprocessing, val/test metrics)
     POST /predict                 append readings for one gun, score the latest window
     GET  /guns                    buffer / alarm state of every gun seen so far
     DELETE /guns/{gun_id}         forget a gun's buffer (e.g. after maintenance)
@@ -39,15 +39,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, ".py"))  # train.py / preprocess.py live there
 import train as trainlib  # noqa: E402  (also makes PCADetector importable for pca bundles)
-from preprocess import BINARY_COL, SENSOR_COLS, TERMINAL_CODE, VALUE_COLS  # noqa: E402
+from preprocess import BINARY_COL, ROLL, SENSOR_COLS, TERMINAL_TO_CLASS, VALUE_COLS, fill_gaps  # noqa: E402
 
 MODEL_PATH = os.environ.get("RSW_MODEL_PATH", os.path.join(PROJECT_ROOT, "models", "baseline_iforest.joblib"))
-ROLL_S = 600  # 10-minute rolling features, as in preprocess.py
-GAP_FILL_LIMIT_S = 60
-OUTLIER_HI, OUTLIER_LO = 5.0, 0.0
+ROLL_S = int(pd.Timedelta(ROLL).total_seconds())  # 10-minute rolling features, as in preprocess.py
+# defaults for bundles written before preprocess_config was stored; a current bundle overrides them
+DEFAULT_PREPROCESS = {"gap_fill_limit": 60, "outlier_hi": 5.0, "outlier_lo": 0.0, "resample": None}
 BUFFER_S = 1800  # per-gun history kept in memory (>= ROLL_S + window + gap limit)
 TOP_K_FEATURES = 8
-CODE_TO_CLASS = {v: k for k, v in TERMINAL_CODE.items()}  # E012 -> E01 ...
+CODE_TO_CLASS = TERMINAL_TO_CLASS  # E012 -> E01 ...
 FaultClass = Literal["E01", "E02", "E03", "E04"]
 SENSOR_NAME = {
     "c1": "Electrode cap offset", "c2": "Electrode force", "c3": "Electrode position",
@@ -219,7 +219,21 @@ class Detector:
         self.sustain: int = int(b.get("sustain", 3))
         self.feat_cols: list[str] = list(b["feature_cols"])
         self.model_cols: list[str] = list(b["model_cols"])
-        self.scaler: dict[str, dict[str, float]] = (b.get("scaler") or {}).get("params") or {}
+        scaler = b.get("scaler") or {}
+        if scaler.get("scale", "global") != "global":
+            raise RuntimeError(f"bundle was trained on '{scaler['scale']}'-scaled data; the API can only reproduce "
+                               "the global scaler online - retrain from preprocess.py --scale global")
+        self.scaler: dict[str, dict[str, float]] = scaler.get("params") or {}
+        cfg = {**DEFAULT_PREPROCESS, **{k: v for k, v in (b.get("preprocess_config") or {}).items()
+                                        if k in DEFAULT_PREPROCESS}}
+        if cfg["resample"]:
+            raise RuntimeError(f"bundle was trained on {cfg['resample']}-resampled data; the API scores 1 Hz windows "
+                               "- retrain without --resample")
+        if not b.get("preprocess_config"):
+            log.warning("bundle has no preprocess_config (retrain with the current train.py); using defaults %s", cfg)
+        self.gap_fill_limit: int = int(cfg["gap_fill_limit"])
+        self.outlier_hi: float = float(cfg["outlier_hi"])
+        self.outlier_lo: float = float(cfg["outlier_lo"])
         tr = b.get("metrics", {}).get("train", {})
         self.score_mean: float = float(tr.get("score_mean", 0.0))
         self.score_std: float = float(tr.get("score_std", 1.0)) or 1.0
@@ -240,17 +254,15 @@ class Detector:
         df = df.resample("s").asfreq()
         present = df.index.isin(raw_index)
         code = df["error"].where(present).ffill().fillna("0").astype(str)
-        x = df[SENSOR_COLS].astype("float32")
-        x = x.ffill(limit=GAP_FILL_LIMIT_S).bfill(limit=GAP_FILL_LIMIT_S)
-        keep = x.notna().all(axis=1)
-        x, code = x[keep], code[keep]
+        x = fill_gaps(df[SENSOR_COLS].astype("float32"), present, self.gap_fill_limit)
+        code = code.loc[x.index]
         if len(x) == 0:
             return None
         # only the last contiguous segment is scored (windows never straddle a long gap)
         step = x.index.to_series().diff().dt.total_seconds().fillna(1)
         seg = (step > 1).cumsum()
         x, code = x[seg == seg.iloc[-1]], code[seg == seg.iloc[-1]]
-        non_welding = (x["c16"] > OUTLIER_HI) | (x["c16"] <= OUTLIER_LO)
+        non_welding = (x["c16"] > self.outlier_hi) | (x["c16"] <= self.outlier_lo)
         x.loc[non_welding, VALUE_COLS + [BINARY_COL]] = np.nan
         x = x.ffill().bfill()
 
@@ -330,9 +342,14 @@ async def health(request: Request) -> dict[str, Any]:
 async def model_card(request: Request) -> dict[str, Any]:
     d: Detector = request.app.state.detector
     b = d.bundle
+    metrics = b.get("metrics", {})
     return {"model": d.info.model_dump(), "features": d.model_cols,
-            "validation": {k: v for k, v in b.get("metrics", {}).get("val", {}).items() if k != "per_file"},
-            "train_files": b.get("train_files"), "val_files": b.get("val_files")}
+            "preprocess": {"gap_fill_limit_s": d.gap_fill_limit, "outlier_hi": d.outlier_hi, "outlier_lo": d.outlier_lo,
+                           "rolling_s": ROLL_S, "scaled_columns": sorted(d.scaler)},
+            "validation": {k: v for k, v in metrics.get("val", {}).items() if k != "per_file"},
+            "test": {k: v for k, v in metrics.get("test", {}).items() if k != "per_file"} or None,
+            "train_files": b.get("train_files"), "val_files": b.get("val_files"),
+            "test_files": metrics.get("test", {}).get("files")}
 
 
 @app.post("/predict", response_model=AnomalyResult | WarmingUp,
