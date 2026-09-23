@@ -17,6 +17,12 @@ Endpoints
 
 A gun needs `window_s` seconds of readings before the first score (HTTP 202 "warming_up"
 until then); the 10-minute rolling features are exact once 600 s of history exist.
+
+Per-gun normalisation (bundle `gun_norm`, see train.py): during the first `warmup_s` of a gun's
+stream the rows are scored with the global scaling and collected; at the end of the warm-up the
+gun's mean (/std) over its normal welding rows and, optionally, its own threshold are fixed and
+every later window is re-normalised with them. `AnomalyResult.gun_norm` says which regime a
+result comes from. DELETE /guns/{id} restarts the warm-up (do it after maintenance).
 """
 from __future__ import annotations
 
@@ -90,10 +96,10 @@ class SensorReading(BaseModel):
     c13: float = Field(description="Setpoint counterbalance pressure")
     c14: float = Field(description="Setpoint electrode force")
     c15: float = Field(description="Setpoint electrode position")
-    c16: float = Field(description="Setpoint sheet thickness; > 5 or <= 0 = non-welding operation")
+    c16: float = Field(description="Setpoint sheet thickness; <= 0 = non-welding operation (cap dressing); the bundle may add an upper bound")
     c17: float = Field(description="Setpoint velocity")
     c18: float = Field(description="Setpoint force build-up")
-    c19: float = Field(description="Offset value in robot")
+    c19: float = Field(description="Offset value in robot (a time counter - not a model input)")
     error: str = Field("0", pattern=r"^(0|E\d{3})$", description="controller state code, '0' = none")
 
     @field_validator("c10", mode="before")
@@ -150,10 +156,16 @@ class ModelInfo(BaseModel):
     type: str
     created: str
     window_s: int
-    threshold: float
+    threshold: float = Field(description="global threshold (quantile of the training-normal scores)")
     threshold_q: float
     sustain: int
     n_features: int
+    alarm_max_non_welding: float | None = Field(
+        None, description="windows whose non_welding_share exceeds this never alarm (None = no gate)")
+    gun_norm: Literal["none", "center", "scale"] = Field(
+        "none", description="per-gun re-normalisation after the warm-up: center = subtract the gun mean, scale = also divide by its std")
+    gun_warmup_s: int | None = Field(None, description="warm-up length per gun stream")
+    gun_threshold_q: float | None = Field(None, description="quantile of the warm-up scores used as the gun's threshold (None = global)")
 
 
 class AnomalyResult(BaseModel):
@@ -161,7 +173,8 @@ class AnomalyResult(BaseModel):
     model_config = ConfigDict(json_schema_extra={"example": {
         "gun_id": "G17", "status": "ok", "window_start": "2021-09-05T02:22:21", "window_end": "2021-09-05T02:23:20",
         "n_samples": 60, "history_s": 1800, "is_anomaly": True, "anomaly_score": 0.61, "threshold": 0.54,
-        "score_z": 4.6, "severity": "critical", "sustained_alarm": True, "consecutive_alarms": 3,
+        "score_z": 4.6, "severity": "critical", "rule_triggered": True, "severity_source": "model+rule",
+        "sustained_alarm": True, "consecutive_alarms": 3,
         "contributing_features": [{"feature": "c5_mean", "sensor": "c5", "sensor_name": "Balance pressure",
                                    "statistic": "mean", "value": -3.1, "reference": 0.02, "contribution": 0.08, "share": 0.41}],
         "context": {"latest_error_code": "E029", "error_active_share": 1.0, "non_welding_share": 0.0,
@@ -175,12 +188,24 @@ class AnomalyResult(BaseModel):
     window_end: datetime
     n_samples: int = Field(description="1 Hz samples in the scored window")
     history_s: int = Field(description="seconds of contiguous history behind the window; < 600 means rolling features are partial")
-    is_anomaly: bool = Field(description="anomaly_score > threshold")
+    is_anomaly: bool = Field(description="anomaly_score > threshold (raw model verdict, before the non-welding gate)")
+    alarm_held: bool = Field(False, description="the window is mostly non-welding (share > model.alarm_max_non_welding): "
+                                                "its sensors are carried-forward constants, so no alarm is raised or counted")
+    hold_reason: str | None = Field(None, description="why alarm_held is true")
     anomaly_score: float = Field(description="higher = more anomalous")
-    threshold: float
+    threshold: float = Field(description="threshold this window was judged against: the gun's own once it has one, else the global")
+    gun_norm: Literal["warming_up", "gun", "global"] = Field(
+        "global", description="warming_up: global scaling while the gun statistics are being collected; "
+                              "gun: window re-normalised with this gun's warm-up statistics; global: no per-gun normalisation")
+    gun_threshold: float | None = Field(None, description="this gun's threshold once its warm-up is over (None otherwise)")
     score_z: float = Field(description="(score - normal mean) / normal std on training windows")
     severity: Literal["normal", "warning", "critical"] = Field(
-        description="normal: below threshold; warning: above; critical: `sustain` consecutive windows above")
+        description="normal: below threshold or held; warning: above; critical: `sustain` consecutive windows above, "
+                    "OR the terminal-code rule fired (rule_triggered)")
+    rule_triggered: bool = Field(False, description="the latest error code is a class's terminal code (E012/E016/E028/E029): "
+                                                    "severity is forced to critical regardless of the model")
+    severity_source: Literal["model", "rule", "model+rule", "none"] = Field(
+        "none", description="what made severity critical: the model's sustained alarm, the terminal-code rule, or both")
     sustained_alarm: bool
     consecutive_alarms: int
     contributing_features: list[FeatureContribution] = Field(description="top features by contribution, descending")
@@ -203,6 +228,9 @@ class GunStatus(BaseModel):
     last_time: datetime | None
     consecutive_alarms: int
     last_score: float | None
+    gun_norm: Literal["warming_up", "gun", "global"] = "global"
+    gun_threshold: float | None = None
+    warmup_rows: int = Field(0, description="rows collected for the gun statistics so far")
 
 
 # ============================================================ model + state
@@ -232,8 +260,15 @@ class Detector:
         if not b.get("preprocess_config"):
             log.warning("bundle has no preprocess_config (retrain with the current train.py); using defaults %s", cfg)
         self.gap_fill_limit: int = int(cfg["gap_fill_limit"])
-        self.outlier_hi: float = float(cfg["outlier_hi"])
+        self.outlier_hi: float | None = None if cfg["outlier_hi"] is None else float(cfg["outlier_hi"])
         self.outlier_lo: float = float(cfg["outlier_lo"])
+        g = b.get("alarm_max_non_welding")
+        self.alarm_max_non_welding: float | None = None if g is None else float(g)
+        gn = b.get("gun_norm")
+        self.gun_norm: dict[str, Any] | None = dict(gn) if gn else None
+        self.norm_cols: list[str] = [c for c in (gn or {}).get("columns", []) if c in self.feat_cols]
+        if self.gun_norm and not self.norm_cols:
+            raise RuntimeError("bundle gun_norm has no usable columns")
         tr = b.get("metrics", {}).get("train", {})
         self.score_mean: float = float(tr.get("score_mean", 0.0))
         self.score_std: float = float(tr.get("score_std", 1.0)) or 1.0
@@ -244,7 +279,65 @@ class Detector:
         self.info = ModelInfo(name=os.path.splitext(os.path.basename(path))[0], type=str(b.get("model_type", "?")),
                               created=str(b.get("created", "?")), window_s=self.window, threshold=self.threshold,
                               threshold_q=float(b.get("threshold_q", float("nan"))), sustain=self.sustain,
-                              n_features=len(self.model_cols))
+                              n_features=len(self.model_cols), alarm_max_non_welding=self.alarm_max_non_welding,
+                              gun_norm=(gn or {}).get("mode", "none"), gun_warmup_s=(gn or {}).get("warmup_s"),
+                              gun_threshold_q=(gn or {}).get("threshold_q"))
+
+    # ---- per-gun normalisation, the online counterpart of train.window_file()
+    def gun_normalise(self, g: "GunState", f: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+        """Collect warm-up rows / fix the gun statistics when the warm-up ends / re-normalise the rows after it.
+        Returns (features to score, threshold to judge against)."""
+        gn = self.gun_norm
+        if gn is None:
+            return f, self.threshold
+        if g.t0 is None:
+            g.t0 = f.index[0]
+        t_end = g.t0 + pd.Timedelta(seconds=int(gn["warmup_s"]))
+        if g.norm_status == "warming_up":
+            new = f[(f.index < t_end) & ((f.index > g.last_warm_time) if g.last_warm_time is not None else True)]
+            if len(new):
+                g.warm_parts.append(new[self.feat_cols + ["non_welding", "error_active"]])
+                g.last_warm_time, g.warmup_rows = new.index[-1], g.warmup_rows + len(new)
+            if f.index[-1] >= t_end:
+                self._finish_warmup(g, t_end)
+        if g.norm_status != "gun":
+            return f, self.threshold
+        f = f.copy()
+        sel = f.index >= g.norm["t_end"]
+        if sel.any():
+            f.loc[sel, self.norm_cols] = ((f.loc[sel, self.norm_cols].to_numpy(dtype="float64") - g.norm["mean"])
+                                          / g.norm["std"]).astype("float32")
+        return f, g.gun_threshold if g.gun_threshold is not None else self.threshold
+
+    def _finish_warmup(self, g: "GunState", t_end: pd.Timestamp) -> None:
+        gn = self.gun_norm
+        warm = pd.concat(g.warm_parts) if g.warm_parts else pd.DataFrame(columns=self.feat_cols + ["non_welding", "error_active"])
+        g.warm_parts.clear()
+        ok = (warm["non_welding"].to_numpy() == 0) & (warm["error_active"].to_numpy() == 0)
+        if int(ok.sum()) < int(gn["min_rows"]):
+            g.norm_status = "global"
+            log.warning("gun warm-up ended with %d normal welding rows (< %d): keeping the global scaling", int(ok.sum()), gn["min_rows"])
+            return
+        x = warm.loc[ok, self.norm_cols].astype("float64")
+        mean = x.mean().to_numpy()
+        std = np.maximum(x.std(ddof=0).fillna(0.0).to_numpy(), float(gn["std_floor"])) if gn["mode"] == "scale" \
+            else np.ones(len(self.norm_cols))
+        g.norm = {"mean": mean, "std": std, "t_end": t_end}
+        q = gn.get("threshold_q")
+        if q is not None:
+            # the warm-up windows, re-normalised with the gun statistics, calibrate the gun's threshold
+            # (minute-aligned windows per contiguous segment, as train.py does offline)
+            wf = warm.copy()
+            wf[self.norm_cols] = ((wf[self.norm_cols].to_numpy(dtype="float64") - mean) / std).astype("float32")
+            step = wf.index.to_series().diff().dt.total_seconds().fillna(1)
+            wf["segment_id"] = (step > 1).cumsum()
+            wf["ttf_s"], wf["label"] = 0.0, 0.0
+            wf["file"] = wf["class"] = wf["gun"] = "online"
+            w = trainlib.window_features(wf, self.window, self.feat_cols)
+            if len(w) >= 10:
+                s = trainlib.anomaly_score(self.model, w[self.model_cols].to_numpy(dtype=np.float32))
+                g.gun_threshold = float(max(self.threshold, np.quantile(s, float(q))))
+        g.norm_status = "gun"
 
     # ---- preprocessing identical in spirit to preprocess.py, on a rolling buffer
     def features(self, raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series] | None:
@@ -262,7 +355,9 @@ class Detector:
         step = x.index.to_series().diff().dt.total_seconds().fillna(1)
         seg = (step > 1).cumsum()
         x, code = x[seg == seg.iloc[-1]], code[seg == seg.iloc[-1]]
-        non_welding = (x["c16"] > self.outlier_hi) | (x["c16"] <= self.outlier_lo)
+        non_welding = x["c16"] <= self.outlier_lo
+        if self.outlier_hi is not None:
+            non_welding |= x["c16"] > self.outlier_hi
         x.loc[non_welding, VALUE_COLS + [BINARY_COL]] = np.nan
         x = x.ffill().bfill()
 
@@ -307,11 +402,19 @@ class Detector:
 
 
 class GunState:
-    def __init__(self) -> None:
+    def __init__(self, gun_norm: bool = False) -> None:
         self.rows: deque[dict[str, Any]] = deque(maxlen=BUFFER_S)
         self.lock = asyncio.Lock()
         self.consecutive_alarms = 0
         self.last_score: float | None = None
+        # per-gun normalisation: rows collected during the warm-up, then the fixed statistics
+        self.norm_status: str = "warming_up" if gun_norm else "global"
+        self.t0: pd.Timestamp | None = None
+        self.last_warm_time: pd.Timestamp | None = None
+        self.warm_parts: list[pd.DataFrame] = []
+        self.warmup_rows = 0
+        self.norm: dict[str, Any] | None = None
+        self.gun_threshold: float | None = None
 
     def frame(self) -> pd.DataFrame:
         return pd.DataFrame(list(self.rows))
@@ -345,7 +448,9 @@ async def model_card(request: Request) -> dict[str, Any]:
     metrics = b.get("metrics", {})
     return {"model": d.info.model_dump(), "features": d.model_cols,
             "preprocess": {"gap_fill_limit_s": d.gap_fill_limit, "outlier_hi": d.outlier_hi, "outlier_lo": d.outlier_lo,
+                           "alarm_max_non_welding": d.alarm_max_non_welding,
                            "rolling_s": ROLL_S, "scaled_columns": sorted(d.scaler)},
+            "gun_norm": d.gun_norm, "dropped_features": b.get("dropped_features"),
             "validation": {k: v for k, v in metrics.get("val", {}).items() if k != "per_file"},
             "test": {k: v for k, v in metrics.get("test", {}).items() if k != "per_file"} or None,
             "train_files": b.get("train_files"), "val_files": b.get("val_files"),
@@ -357,7 +462,7 @@ async def model_card(request: Request) -> dict[str, Any]:
 async def predict(req: PredictRequest, request: Request) -> AnomalyResult | JSONResponse:
     d: Detector = request.app.state.detector
     guns: dict[str, GunState] = request.app.state.guns
-    g = guns.setdefault(req.gun_id, GunState())
+    g = guns.setdefault(req.gun_id, GunState(gun_norm=d.gun_norm is not None))
     async with g.lock:
         for r in req.readings:
             row = r.model_dump()
@@ -370,17 +475,26 @@ async def predict(req: PredictRequest, request: Request) -> AnomalyResult | JSON
                              message=f"need {d.window} contiguous 1 Hz samples, have {n}")
             return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body.model_dump())
         f, error_active, non_welding = out
+        f, threshold = d.gun_normalise(g, f)
         vec = d.window_vector(f)
         score, feats = d.score(vec)
-        is_anomaly = score > d.threshold
-        g.consecutive_alarms = g.consecutive_alarms + 1 if is_anomaly else 0
+        w = f.iloc[-d.window:]
+        nw_share = float(w["non_welding"].mean())
+        is_anomaly = score > threshold
+        held = d.alarm_max_non_welding is not None and nw_share > d.alarm_max_non_welding
+        alarm = is_anomaly and not held
+        g.consecutive_alarms = g.consecutive_alarms + 1 if alarm else 0
         g.last_score = score
         sustained = g.consecutive_alarms >= d.sustain
-        w = f.iloc[-d.window:]
         latest_code = str(w["error_code"].iloc[-1])
+        # terminal-code rule (test.md P2): the model scores the terminal state below threshold, the
+        # ontology stage must still be triggered - the rule forces critical, independent of the model
+        rule_hit = CODE_TO_CLASS.get(latest_code) is not None
+        severity = "critical" if (sustained or rule_hit) else "warning" if alarm else "normal"
+        severity_source = ("model+rule" if sustained and rule_hit else "model" if sustained else "rule" if rule_hit else "none")
         ctx = WindowContext(latest_error_code=latest_code,
                             error_active_share=float(w["error_active"].mean()),
-                            non_welding_share=float(w["non_welding"].mean()),
+                            non_welding_share=nw_share,
                             welds_in_window=float(w["welds_delta"].sum() * d.scaler.get("welds_delta", {}).get("std", 1.0)
                                                   + d.window * d.scaler.get("welds_delta", {}).get("mean", 0.0)),
                             welds_10min=float(w["welds_10min"].iloc[-1] * d.scaler.get("welds_10min", {}).get("std", 1.0)
@@ -390,8 +504,11 @@ async def predict(req: PredictRequest, request: Request) -> AnomalyResult | JSON
         return AnomalyResult(
             gun_id=req.gun_id, window_start=w.index[0].to_pydatetime(), window_end=w.index[-1].to_pydatetime(),
             n_samples=int(len(w)), history_s=int(len(f)), is_anomaly=bool(is_anomaly), anomaly_score=score,
-            threshold=d.threshold, score_z=(score - d.score_mean) / d.score_std,
-            severity="critical" if sustained else "warning" if is_anomaly else "normal",
+            alarm_held=bool(held),
+            hold_reason=f"non_welding_share {nw_share:.2f} > gate {d.alarm_max_non_welding}" if held else None,
+            threshold=threshold, gun_norm=g.norm_status, gun_threshold=g.gun_threshold,
+            score_z=(score - d.score_mean) / d.score_std,
+            severity=severity, rule_triggered=rule_hit, severity_source=severity_source,
             sustained_alarm=sustained, consecutive_alarms=g.consecutive_alarms,
             contributing_features=feats, context=ctx, model=d.info)
 
@@ -403,7 +520,8 @@ async def guns(request: Request) -> list[GunStatus]:
         times = [r["time"] for r in g.rows]
         out.append(GunStatus(gun_id=gid, n_samples=len(g.rows), first_time=min(times) if times else None,
                              last_time=max(times) if times else None, consecutive_alarms=g.consecutive_alarms,
-                             last_score=g.last_score))
+                             last_score=g.last_score, gun_norm=g.norm_status, gun_threshold=g.gun_threshold,
+                             warmup_rows=g.warmup_rows))
     return out
 
 

@@ -56,7 +56,9 @@ def synth_file(path, cls, seed, start="2021-09-01T00:00:00Z"):
     df["error"] = "0"
     df.loc[(ttf < 300), "error"] = TERMINAL[cls]  # terminal code in the last 5 min
     df.loc[3000:3299, "error"] = "E003"  # a long-lived minor state in the middle
-    df.loc[1500:1799, "c16"] = 0.0  # cap dressing block -> non_welding
+    # cap dressing block -> non_welding. Deliberately starts mid-minute (t+1530 s) so that one
+    # 60 s window is half covered: that is what distinguishes the "mean" aggregation from "max".
+    df.loc[1530:1799, "c16"] = 0.0
     df = df.drop(index=range(2400, 2490))  # 90 s gap -> new segment
     df = df.drop(index=[100, 101, 500])  # short gaps -> ffill
     df.to_csv(path, index=False)
@@ -92,7 +94,7 @@ def test_1_preprocess_train(workspace):
     assert (pre / "scaler.json").exists() and (pre / "preprocess_config.json").exists()
     df = pd.read_parquet(pre / "E01_0.parquet")
     assert df["segment_id"].nunique() == 2, "the 90 s gap must split the file into two segments"
-    assert df["non_welding"].sum() == 300
+    assert df["non_welding"].sum() == 270
     assert df["label"].sum() == PRE_FAILURE_S + 1 and df["terminal_code"].sum() == 300
     assert "c11" not in df.columns and "c12" not in df.columns, "counters are replaced by deltas"
     assert {"welds_delta", "pos_delta", "welds_10min", "error_share_10min"} <= set(df.columns)
@@ -116,10 +118,32 @@ def test_2_preprocess_test_split(workspace):
     assert np.isclose(tr["c13"].iloc[0], te["c13"].iloc[0])
 
 
+def test_2b_window_columns(workspace):
+    """Windowing must give the 24 features a _mean/_std pair and leave metadata names alone.
+    Regression: `non_welding` is aggregated with "mean" and used to become `non_welding_mean`,
+    which broke --exclude-non-welding and dropped the column from the score CSVs."""
+    from train import feature_columns, model_input_columns, window_features
+
+    df = pd.read_parquet(workspace["pre"] / "E01_0.parquet")
+    feat = feature_columns(df)
+    w = window_features(df, 60, feat)
+    assert len(feat) == 24 and len(model_input_columns(feat)) == 48
+    assert set(model_input_columns(feat)) <= set(w.columns)
+    for c in ("non_welding", "error_active", "terminal_code", "label", "ttf_s", "n"):
+        assert c in w.columns, f"{c} must keep its own name"
+        assert f"{c}_mean" not in w.columns
+    nw = w["non_welding"]
+    assert nw.min() == 0.0 and nw.max() == 1.0, "non_welding is a share over the window"
+    assert (nw == 0.5).sum() == 1, "the half-covered window must be 0.5, i.e. a mean and not a max"
+    assert (nw == 1.0).sum() == 4
+    assert w["n"].max() == 60 and w["n"].min() >= 30
+
+
 def test_3_train_and_evaluate(workspace):
+    # 30 min warm-up so that the 2 h synthetic files exercise the per-gun normalisation + threshold
     out = run(os.path.join(PY, "train.py"), "--data-dir", workspace["pre"], "--model-dir", workspace["models"],
-              "--val-frac", "0.5", "--window", "60")
-    assert "val: AUROC" in out and "test: AUROC" in out
+              "--val-frac", "0.5", "--window", "60", "--warmup-hours", "0.5")
+    assert "val: AUROC" in out and "test: AUROC" in out and "gun-normalised" in out
     metrics = json.load(open(workspace["models"] / "baseline_iforest_metrics.json", encoding="utf-8"))
     assert metrics["train_files"] and metrics["val_files"]
     assert not set(metrics["train_files"]) & set(metrics["val_files"]), "split is by file"
@@ -127,6 +151,15 @@ def test_3_train_and_evaluate(workspace):
     assert metrics["metrics"]["test"]["file_class"] == {"test_0": "E04", "test_1": "E02"}
     assert len(metrics["feature_reference"]) == len(metrics["model_cols"])
     assert metrics["preprocess_config"]["gap_fill_limit"] == 60
+    assert metrics["preprocess_config"]["outlier_hi"] is None, "c16 > x rule is off by default"
+    assert metrics["alarm_max_non_welding"] == 0.5 and "held_windows" in metrics["metrics"]["val"]
+    assert metrics["dropped_features"] == ["c19"] and len(metrics["model_cols"]) == 46, "c19 is a time counter (leak)"
+    gn = metrics["gun_norm"]
+    assert gn["mode"] == "center" and gn["warmup_s"] == 1800 and gn["threshold_q"] == 0.99
+    assert "c7" in gn["columns"] and "hour_sin" not in gn["columns"] and "weld_duty_10min" not in gn["columns"]
+    assert metrics["metrics"]["test"]["files_gun_normalised"] == 2 and metrics["metrics"]["test"]["files_gun_threshold"] == 2
+    for v in metrics["metrics"]["test"]["per_file"].values():
+        assert v["gun_norm"] == "gun" and v["threshold"] >= metrics["threshold"]
     assert metrics["metrics"]["val"]["auroc"] > 0.5, "the drifting c5 in the pre-failure window must be detectable"
 
     out = run(os.path.join(PY, "train.py"), "--evaluate", "--data-dir", workspace["pre"], "--model-dir", workspace["models"])
@@ -134,7 +167,21 @@ def test_3_train_and_evaluate(workspace):
     tm = json.load(open(workspace["models"] / "baseline_iforest_test_metrics.json", encoding="utf-8"))
     assert tm["test"]["auroc"] == pytest.approx(metrics["metrics"]["test"]["auroc"])
     scores = pd.read_csv(workspace["models"] / "scores" / "test_0_iforest.csv", index_col=0, parse_dates=True)
-    assert {"score", "alarm", "ttf_s", "label"} <= set(scores.columns)
+    assert {"score", "alarm", "threshold", "ttf_s", "label", "error_active", "non_welding", "warmup"} <= set(scores.columns)
+    assert scores["warmup"].iloc[0] == 1 and scores["warmup"].iloc[-1] == 0
+    assert np.allclose(scores.loc[scores["warmup"] == 1, "threshold"], metrics["threshold"])
+    assert (scores.loc[scores["warmup"] == 0, "threshold"] >= metrics["threshold"] - 1e-9).all()
+
+    # without gun normalisation the bundle carries gun_norm = None and plain global thresholds
+    out = run(os.path.join(PY, "train.py"), "--data-dir", workspace["pre"], "--val-frac", "0.5", "--gun-norm", "none",
+              "--no-test", "--model-dir", workspace["ws"] / "models_global")
+    m2 = json.load(open(workspace["ws"] / "models_global" / "baseline_iforest_metrics.json", encoding="utf-8"))
+    assert m2["gun_norm"] is None and m2["metrics"]["val"]["files_gun_normalised"] == 0
+
+    # --exclude-non-welding must run (it used to raise KeyError: 'non_welding')
+    out = run(os.path.join(PY, "train.py"), "--data-dir", workspace["pre"], "--val-frac", "0.5",
+              "--exclude-non-welding", "--no-test", "--model-dir", workspace["ws"] / "models_xnw")
+    assert "fitting iforest" in out and "val: AUROC" in out
 
     out = run(os.path.join(PY, "train.py"), "--score", str(workspace["pre"] / "test" / "test_1.parquet"),
               "--model-dir", workspace["models"])
@@ -150,8 +197,11 @@ def test_4_api_matches_offline(workspace):
     raw = pd.read_csv(workspace["test"] / "test_0.csv", dtype={"c10": str, "error": str})
     with TestClient(main.app) as client:
         card = client.get("/model").json()
-        assert card["model"]["n_features"] == 48 and card["test"]["auroc"] is not None
+        assert card["model"]["n_features"] == 46 and card["test"]["auroc"] is not None
+        assert card["dropped_features"] == ["c19"] and "c19_mean" not in card["features"]
         assert card["preprocess"]["gap_fill_limit_s"] == 60
+        assert card["model"]["gun_norm"] == "center" and card["model"]["gun_warmup_s"] == 1800
+        assert card["gun_norm"]["threshold_q"] == 0.99
 
         # first 30 s -> warming up
         r = client.post("/predict", json={"gun_id": "G1", "readings": raw.iloc[:30].to_dict("records")})
@@ -166,6 +216,10 @@ def test_4_api_matches_offline(workspace):
         assert res["n_samples"] == 60 and res["severity"] in ("normal", "warning", "critical")
         assert res["context"]["known_code_class_hint"] is None
         assert len(res["contributing_features"]) == 8 and res["contributing_features"][0]["reference"] != 0
+        assert res["alarm_held"] is False and res["hold_reason"] is None
+        assert card["model"]["alarm_max_non_welding"] == 0.5
+        assert res["gun_norm"] == "warming_up" and res["gun_threshold"] is None, "20 min < 30 min warm-up"
+        assert res["threshold"] == pytest.approx(card["model"]["threshold"])
 
         # the API's online preprocessing must reproduce the offline pipeline on the same window
         d = main.app.state.detector
@@ -176,11 +230,47 @@ def test_4_api_matches_offline(workspace):
         score_off = float(main.trainlib.anomaly_score(d.model, vec_off[None])[0])
         assert res["anomaly_score"] == pytest.approx(score_off, abs=1e-4)
 
+        # past the warm-up: the gun statistics are fixed, later windows are re-normalised and judged
+        # against the gun's own threshold - exactly as train.window_file() / gun_thresholds() do offline
+        # (up to the 90 s gap: raw row 2390 ~ t = 2393 s > the 1800 s warm-up)
+        r = client.post("/predict", json={"gun_id": "G1", "readings": raw.iloc[1200:2390].to_dict("records")})
+        assert r.status_code == 200, r.text
+        res = r.json()
+        assert res["gun_norm"] == "gun" and res["gun_threshold"] is not None
+        assert res["threshold"] == pytest.approx(res["gun_threshold"]) and res["threshold"] >= card["model"]["threshold"]
+        gs = {g["gun_id"]: g for g in client.get("/guns").json()}["G1"]
+        assert gs["gun_norm"] == "gun" and gs["warmup_rows"] >= 1700
+        gn, cols = d.gun_norm, d.norm_cols
+        stats = main.trainlib.gun_norm_stats(off, cols, gn)
+        assert stats is not None and stats["n"] >= 1000
+        off_n = main.trainlib.apply_gun_norm(off, cols, stats)
+        w_end = pd.Timestamp(res["window_end"])
+        vec_off = d.window_vector(off_n.loc[:w_end])
+        score_off = float(main.trainlib.anomaly_score(d.model, vec_off[None])[0])
+        assert res["anomaly_score"] == pytest.approx(score_off, abs=1e-3)
+        w_off, calib = main.trainlib.window_file(off, 60, d.feat_cols, gn, cols)
+        thr_off = main.trainlib.gun_thresholds(d.model, d.model_cols, calib, d.threshold, gn["threshold_q"])["test_0"]
+        assert res["gun_threshold"] == pytest.approx(thr_off, abs=2e-3)
+        # gun constants (c7-c9) are centred away: their window means are 0 after the warm-up
+        assert all(c["value"] == 0 for c in res["contributing_features"] if c["sensor"] in ("c7", "c8", "c9"))
+
         # the failure end: terminal code -> class hint for the ontology stage
         r = client.post("/predict", json={"gun_id": "G2", "readings": raw.iloc[-1500:].to_dict("records")})
         assert r.status_code == 200 and r.json()["context"]["known_code_class_hint"] == "E04"
         assert r.json()["context"]["latest_error_code"] == "E029"
+        # terminal-code rule: severity is critical whatever the model says
+        assert r.json()["rule_triggered"] is True and r.json()["severity"] == "critical"
+        assert r.json()["severity_source"] in ("rule", "model+rule")
+        assert res["rule_triggered"] is False and res["severity_source"] in ("none", "model")
 
-        assert {g["gun_id"] for g in client.get("/guns").json()} == {"G1", "G2"}
+        # a window inside the cap-dressing block: alarms are held, never counted, severity stays normal
+        r = client.post("/predict", json={"gun_id": "G3", "readings": raw.iloc[1400:1700].to_dict("records")})
+        assert r.status_code == 200, r.text
+        held = r.json()
+        assert held["context"]["non_welding_share"] == 1.0 and held["alarm_held"] is True
+        assert held["hold_reason"].startswith("non_welding_share 1.00 > gate 0.5")
+        assert held["severity"] == "normal" and held["consecutive_alarms"] == 0
+
+        assert {g["gun_id"] for g in client.get("/guns").json()} == {"G1", "G2", "G3"}
         assert client.delete("/guns/G1").status_code == 204
         assert client.delete("/guns/G1").status_code == 404

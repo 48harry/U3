@@ -8,9 +8,13 @@ Every rule below comes from eda_out/ (72 files) and the paper's pre-processing s
               segments (rows dropped) so windows never straddle a hole.
   discard     files with missing rate > --max-missing-rate (paper: 40 %). That is the 8
               E02 files at 64-84 %, including E02_2 (10 min "demo" file).
-  outliers    c16 (sheet-thickness setpoint) > 5 or <= 0 = cap dressing / changing, not
-              welding. Sensor values in those rows are blanked and forward-filled (paper),
-              and the rows are flagged `non_welding` so the model can drop or keep them.
+  outliers    c16 (sheet-thickness setpoint) <= 0 = cap dressing / changing, not welding.
+              Sensor values in those rows are blanked and forward-filled (paper), and the rows
+              are flagged `non_welding` so the model can drop or keep them. The paper/benchmark
+              also treat c16 > 5 (6) as non-welding; that branch is OFF by default since
+              2026-09-23: in the train set it fires on < 1.3 % of rows, but two test guns run at
+              a setpoint of 8.7 for 85-92 % of the time while welding, and the rule turned
+              nearly all their data into carried-forward constants. --outlier-hi 5 restores it.
   counters    c11 / c12 are cumulative and gun-specific -> replaced by per-second deltas and
               a 10-min rolling weld count (welding-behaviour pattern, paper Fig. 8).
   c10         on/off -> 1/0.
@@ -153,7 +157,9 @@ def preprocess_file(path, args):
         return None, {**base, "dropped": "no rows left after gap filtering"}
     # 2) non-welding rows (cap dressing / changing): blank the sensors and carry the last
     #    welding value across, however long the block is (paper). Rows stay, flagged.
-    non_welding = (x["c16"] > args.outlier_hi) | (x["c16"] <= args.outlier_lo)
+    non_welding = x["c16"] <= args.outlier_lo
+    if args.outlier_hi is not None:
+        non_welding |= x["c16"] > args.outlier_hi
     out["non_welding"] = non_welding.astype("float32")
     x.loc[non_welding, VALUE_COLS + [BINARY_COL]] = np.nan  # counters keep counting during cap dressing
     x = x.ffill().bfill()
@@ -261,6 +267,11 @@ def reader(fmt):
     return lambda p: pd.read_csv(p + ".csv", index_col=0, parse_dates=True)
 
 
+def optional_float(v):
+    """argparse type: 'none' / 'off' -> None, otherwise float."""
+    return None if str(v).lower() in ("none", "off", "null") else float(v)
+
+
 def inherit_train_config(ap, args):
     """Test files must get exactly the train transform: every inherited option the user did not
     pass explicitly is read from the train run's preprocess_config.json."""
@@ -299,7 +310,8 @@ def main():
     ap.add_argument("--max-files", type=int, default=None)
     ap.add_argument("--max-missing-rate", type=float, default=0.40, help="paper: discard guns above this")
     ap.add_argument("--gap-fill-limit", type=int, default=60, help="seconds; longer gaps split segments")
-    ap.add_argument("--outlier-hi", type=float, default=5.0, help="c16 above this = non-welding")
+    ap.add_argument("--outlier-hi", type=optional_float, default=None,
+                    help="c16 above this = non-welding; default none (see docstring), paper rule: 5")
     ap.add_argument("--outlier-lo", type=float, default=0.0, help="c16 at/below this = non-welding")
     ap.add_argument("--pre-failure-window", type=int, default=3600, help="seconds before failure labelled 1")
     ap.add_argument("--resample", default=None, help="pandas offset, e.g. 10s or 1min; default keeps 1 Hz")
