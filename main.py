@@ -487,7 +487,7 @@ async def predict(req: PredictRequest, request: Request) -> AnomalyResult | JSON
         g.last_score = score
         sustained = g.consecutive_alarms >= d.sustain
         latest_code = str(w["error_code"].iloc[-1])
-        # terminal-code rule (test.md P2): the model scores the terminal state below threshold, the
+        # terminal-code rule (history.md P2-1): the model scores the terminal state below threshold, the
         # ontology stage must still be triggered - the rule forces critical, independent of the model
         rule_hit = CODE_TO_CLASS.get(latest_code) is not None
         severity = "critical" if (sustained or rule_hit) else "warning" if alarm else "normal"

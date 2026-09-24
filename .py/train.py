@@ -71,7 +71,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLASSES = ["E01", "E02", "E03", "E04"]
-# target operating point (test.md §4 P2): a sustained alarm at least this early, at most this many false runs
+# target operating point (test.md §1, history.md P2): a sustained alarm at least this early, at most this many false runs
 OP_LEAD_MIN = 30.0
 OP_FALSE_RUNS = 1.0
 META_COLS = {"file", "class", "gun", "error_code", "segment_id", "dow", "ttf_s", "label",
@@ -80,7 +80,7 @@ FLAG_COLS = ["error_active", "terminal_code", "non_welding", "label", "warmup"]
 # c19 ("offset value in robot") is a counter that grows ~55/s through every file. Every file is
 # exactly 7 days long and ends at its failure, so within a file c19 == time since start ==
 # 168 h - time to failure: a label leak, not a measurement (a supervised model reaches AUROC 0.98
-# with it and 0.62 without - test.md §8). Dropped from the model input by default.
+# with it and 0.62 without - history.md, old test.md §8). Dropped from the model input by default.
 DROP_FEATURES_DEFAULT = ["c19"]
 
 

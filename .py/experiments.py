@@ -1,5 +1,5 @@
 """
-P1 / P2 experiment lab for test.md §4 (2026-09-23).
+P1 / P2 experiment lab (history.md, old test.md §4; 2026-09-23).
 
 Windows the preprocessed files ONCE per window length - with the production per-gun
 normalisation from train.py - into results/p1p2/cache/, then runs the experiments on those
