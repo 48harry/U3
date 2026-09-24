@@ -140,7 +140,7 @@ E01~E04를 정답으로 삼는 분류는 하지 않는다. 정상 대비 이탈 
 
 이상탐지 신호가 나온 다음 단계다. **현재 1~2번까지의 입력 계약(`AnomalyResult`)만 구현되어 있고, 3번 이후는 미구현이다**(5.7절, 5.9절).
 
-1. 필터링된 강한 이상 시그널이 탐지되면 Root Cause Agent로 전달 → **구현됨**: `severity: critical`(3회 연속 임계 초과)이 트리거 기준
+1. 필터링된 강한 이상 시그널이 탐지되면 Root Cause Agent로 전달 → **구현됨**: `severity: critical`(임계 초과가 sustain × window = 180초 이상 지속, 또는 종료 코드 에피소드 시작)이 트리거 기준
 2. Agent가 이상 감지 시점 앞뒤의 센서 수치·로그 스트림을 모아 컨텍스트 구성 → **부분 구현**: `contributing_features`(어떤 센서가 점수를 올렸는지)와 `context`(에러 코드, 용접 활동량)를 API가 이미 내보낸다
 3. 감지된 에러 코드에 맞는 정비 지침서를 Vector DB에서 RAG로 검색 → **미구현**
 4. LLM이 이상 패턴과 검색된 매뉴얼을 융합해 원인·영향도·조치 가이드를 자연어로 요약 → **미구현**
@@ -221,17 +221,19 @@ E01·E03·E04는 2021년 8~10월에 몰려 있는데, **E02는 2019년 12월~202
                   .py/train.py --evaluate ──► models/baseline_iforest_test_metrics.json, models/scores/test_N_iforest.csv
                   .py/experiments.py ───────► results/p1p2/*.json   (P1·P2 실험, 운영과 무관)
  models/ ───────► main.py (FastAPI) ────────► AnomalyResult JSON ──► 온톨로지 / RAG / LLM 리포트 / Slack (3절, 미구현)
+ test/*.csv ───► .py/replay.py ──(HTTP)──► main.py /predict   (원본 CSV를 실시간 스트림처럼 재생)
 ```
 
 | 단계 | 명령 | 입력 → 출력 | 소요 |
 |---|---|---|---|
-| 0. 스모크 테스트 | `pytest` | 합성 데이터 → 임시 폴더 | 15초 |
+| 0. 스모크 테스트 | `pytest` | 합성 데이터 → 임시 폴더 | 1분 |
 | 1. EDA (선택) | `python .py/eda.py` | `train/` → `eda_out/` | 40분 |
 | 2. 전처리(학습) | `python .py/preprocess.py` | `train/` → `preprocessed/` | 7분 |
 | 3. 전처리(테스트) | `python .py/preprocess.py --split test` | `test/` + 2단계 산출물 → `preprocessed/test/` | 40초 |
 | 4. 학습·평가 | `python .py/train.py --exclude-non-welding --cv 4` | `preprocessed/` → `models/` | 5분 (`--cv` 없이 3분) |
 | 4'. 테스트 재평가 | `python .py/train.py --evaluate` | `models/` + `preprocessed/test/` → `models/` | 20초 |
 | 5. 서빙 | `uvicorn main:app --reload` | `models/` + 센서 스트림 → JSON | — |
+| 5'. 스트림 재생 | `python .py/replay.py test/test_0.csv` | 원본 CSV → `/predict` → critical 이벤트 출력 | 건당 7일 ~2분 (20분 청크) |
 
 한 번에: `python .py/preprocess.py && python .py/preprocess.py --split test && python .py/train.py --exclude-non-welding --cv 4` (약 13분). 순서가 중요하다 — 3단계는 2단계의 `scaler.json`·`preprocess_config.json`을 읽고, 4단계는 3단계 산출물이 있어야 테스트 지표를 낸다.
 
@@ -245,7 +247,7 @@ U3/
 ├─ eda_out/                1단계 산출물
 ├─ models/                 4단계 산출물 (joblib 번들, 지표 JSON, scores/)
 ├─ results/                절제 실험 지표 JSON: p0/ (비용접·건별 정규화), p1p2/ (P1·P2; cache/는 git 제외)
-├─ .py/                    스크립트: eda.py, preprocess.py, train.py, experiments.py(P1·P2 실험), Benchmark.py(원본),
+├─ .py/                    스크립트: eda.py, preprocess.py, train.py, replay.py(API 스트림 재생), experiments.py(P1·P2 실험), Benchmark.py(원본),
 │                          Benchmark_fixed.py, error_check.py·file_check.py(원본 CSV 점검용 단발 스크립트)
 ├─ main.py                 FastAPI 서빙
 ├─ tests/test_pipeline.py  E2E 스모크 테스트
@@ -604,11 +606,11 @@ g.columns = [f"{a}_{b}" if a in feat_cols and b in ("mean", "std") else a for a,
 
 `main.py`는 `sys.path`에 `.py/`를 넣어 `train`·`preprocess`를 import하고, `RSW_MODEL_PATH`(기본 `models/baseline_iforest.joblib`)의 번들을 기동 시 로드한다. 번들에 든 `scaler`와 `preprocess_config`(gap 한도, c16 임계)로 전처리를 온라인으로 재현하므로 클라이언트는 아무 전처리도 하지 않는다.
 
-**건별 워밍업.** 건마다 첫 6시간(`gun_norm.warmup_s`)의 행을 모아 두었다가 워밍업이 끝나면 그 건의 평균과 건별 임계값을 고정하고, 이후 윈도우를 그것으로 판정한다. 그 전까지는 글로벌 기준(`gun_norm: warming_up`). 정상·용접 행이 600개 미만이면 `global`로 남는다. **요청 청크는 30분 버퍼보다 작게** 보내야 워밍업 행이 유실되지 않는다. 정비 후에는 `DELETE /guns/{id}`로 워밍업을 다시 시작한다.
+**건별 워밍업.** 건마다 첫 6시간(`gun_norm.warmup_s`)의 행을 모아 두었다가 워밍업이 끝나면 그 건의 평균과 건별 임계값을 고정하고, 이후 윈도우를 그것으로 판정한다. 그 전까지는 글로벌 기준(`gun_norm: warming_up`). 정상·용접 행이 600개 미만이면 `global`로 남는다. 요청당 최대 **1,200행**(30분 버퍼 − 롤링 이력 10분)이고 넘으면 422다 — 예전처럼 버퍼를 넘는 행이 조용히 버려지지 않는다. 정비 후에는 `DELETE /guns/{id}`로 워밍업을 다시 시작한다.
 
 | 메서드 | 경로 | 역할 |
 |---|---|---|
-| POST | `/predict` | `{gun_id, readings:[SensorReading]}` → 건별 30분 버퍼에 추가, 최신 60초 윈도우 스코어링. 60초 미만이면 `202 warming_up` |
+| POST | `/predict` | `{gun_id, readings:[SensorReading]}`(≤1,200행) → 건별 30분 버퍼에 추가, 직전 요청 이후 완결된 윈도우를 최신 행부터 60초 간격으로 모두 스코어링(지속 알람 상태가 윈도우마다 갱신됨), 응답은 최신 윈도우. 60초 미만이거나 용접 행을 아직 못 봤으면 `202 warming_up` |
 | GET | `/model` | 모델 카드: 윈도우·임계값·피처(`dropped_features` 포함)·전처리 파라미터·건별 정규화 레시피·검증/테스트 지표·파일 목록 |
 | GET | `/health`, `/guns` | 상태 / 건별 버퍼·연속 알람·워밍업 상태(`gun_norm`, `gun_threshold`, `warmup_rows`) |
 | DELETE | `/guns/{gun_id}` | 버퍼 리셋(정비 후) |
@@ -620,8 +622,10 @@ g.columns = [f"{a}_{b}" if a in feat_cols and b in ("mean", "std") else a for a,
 ```json
 {"gun_id": "G0", "status": "ok", "window_start": "...", "window_end": "...", "n_samples": 60, "history_s": 1809,
  "is_anomaly": true, "anomaly_score": 0.61, "threshold": 0.58, "gun_norm": "gun", "gun_threshold": 0.58, "score_z": 4.6,
- "severity": "critical", "rule_triggered": true, "severity_source": "model+rule",
- "sustained_alarm": true, "consecutive_alarms": 3, "alarm_held": false, "hold_reason": null,
+ "severity": "critical", "rule_triggered": true, "rule_trigger_time": "...", "rule_code": "E029", "rule_class_hint": "E04",
+ "rule_code_active": true, "severity_source": "model+rule", "sustained_alarm": true, "sustained_in_request": true,
+ "consecutive_alarms": 3, "alarm_duration_s": 180, "windows_scored": 1, "critical_in_request": true,
+ "alarm_held": false, "hold_reason": null,
  "contributing_features": [{"feature": "c5_mean", "sensor": "c5", "sensor_name": "Balance pressure",
                             "statistic": "mean", "value": -3.1, "reference": 0.02, "contribution": 0.08, "share": 0.41}],
  "context": {"latest_error_code": "E029", "error_active_share": 1.0, "non_welding_share": 0.0,
@@ -632,18 +636,33 @@ g.columns = [f"{a}_{b}" if a in feat_cols and b in ("mean", "std") else a for a,
 ```
 
 - `threshold`: **이 윈도우를 판정한 임계값** — 워밍업이 끝난 건은 `gun_threshold`, 그 전·글로벌 건은 `model.threshold`(글로벌). `gun_norm`은 `warming_up` / `gun` / `global`.
-- `rule_triggered` / `severity_source`: 최신 error 코드가 종료 코드(E012/E016/E028/E029)면 모델과 무관하게 `severity=critical`(`rule_triggered=true`). `severity_source`는 `model`(지속 알람) / `rule` / `model+rule` / `none`. 모델이 종료 상태를 임계값 아래로 보는 문제(`test.md` 3절)를 규칙으로 메운다 — 보장되는 선행은 마지막 ~10분
-- `severity`: `normal`(임계 미만) / `warning`(초과) / `critical`(`sustain`=3회 연속 초과) — 3절의 "연속 N회일 때만 RAG 트리거" 기준
+- `rule_triggered` / `severity_source`: 이 요청의 행에서 종료 코드(E012/E016/E028/E029) **에피소드가 시작**되고 건의 쿨다운(30분, `model.rule_cooldown_s`)이 지났으면 모델과 무관하게 `severity=critical`. 코드가 떠 있는 동안 계속 critical이 아니다 — E029는 E01~E03 건에서도 고장 며칠 전부터 수 시간씩 떠 있다(테스트 test_0 16시간). `rule_code`·`rule_class_hint`는 발화시킨 코드와 그 클래스(윈도우 끝에서는 코드가 이미 사라졌을 수 있으므로 온톨로지는 `context.known_code_class_hint`가 아니라 이것을 쓴다). `rule_code_active`는 최신 코드가 종료 코드인지(상태). `severity_source`는 `model`(지속 알람) / `rule` / `model+rule` / `none`. 보장되는 선행은 마지막 ~10분, 오트리거는 테스트 평균 0.25회/일/건
+- `severity`: `normal`(임계 미만) / `warning`(초과) / `critical`(임계 초과가 `sustain × window` = 180초 이상 연속, `alarm_duration_s`) — 3절의 "연속 N회일 때만 RAG 트리거" 기준. **시간 기준**이라 클라이언트 호출 주기와 무관하다(1초마다 호출해도 3초 만에 critical이 되지 않는다). `critical_in_request`는 청크 중간 윈도우가 critical이었던 경우까지 포함하므로 하류 트리거는 이 필드를 본다
 - `alarm_held`: 윈도우의 `non_welding_share`가 번들의 `alarm_max_non_welding`(0.5)을 넘으면 `true`. 이때 `is_anomaly`·점수는 그대로 주되 `severity`는 `normal`, `consecutive_alarms`는 0으로 리셋된다(비용접 중 점수는 신뢰하지 않는다). `hold_reason`에 이유가 들어간다.
 - `contributing_features`: 피처 하나를 정상 기준값(`feature_reference`)으로 치환했을 때의 점수 감소량, 상위 8개. 모델 무관 방식
 - `known_code_class_hint`: 최신 error 코드가 종료 코드면 그 클래스. 모델과 무관한 안전장치
-- 요청당 ~40 ms(워밍업 중에는 행 수집이 더해져 조금 더). 실데이터로 온라인 점수·건별 임계값이 오프라인(`train.window_file`)과 일치함을 확인했다(차이 ≤0.0002, 워밍업 경계의 채움 차이). 50분 청크로 보내면 워밍업 행이 유실된다(21,600 → 13,688행)
+- 요청당 ~40 ms(워밍업 중에는 행 수집이 더해져 조금 더). 실데이터로 온라인 점수·건별 임계값이 오프라인(`train.window_file`)과 일치함을 확인했다(차이 ≤0.0002, 워밍업 경계의 채움 차이). 비용접 구간이 30분 버퍼보다 길어도 마지막 용접 값을 건별로 들고 있다가 채운다(오프라인과 같은 무제한 carry; 전에는 NaN → HTTP 500). 실데이터 재생: 테스트 8건 × 마지막 12시간(10분 청크) 83초, 8/8건 고장 직전 규칙 critical
 - `per-file` 스케일·`--resample` 번들은 기동 시 `RuntimeError`
+
+#### 5.7.1 스트림 재생 (`python .py/replay.py`)
+
+원본 CSV를 건 하나의 실시간 스트림처럼 `/predict`에 보낸다(`gun_id` = 파일 이름). 서버를 먼저 띄운다(`uvicorn main:app`).
+
+```
+python .py/replay.py test/test_0.csv                          # 7일 전체, 60초 청크, 최대 속도
+python .py/replay.py "test/test_*.csv" --chunk-s 1200          # 8건, 20분 청크 (건당 ~2분)
+python .py/replay.py test/test_3.csv --start-hours 156 --out-dir results/replay   # 마지막 12시간, 응답 JSONL 저장
+python .py/replay.py test/test_0.csv --speed 60               # 60배속
+```
+
+- critical 이벤트(지속 알람 에피소드의 시작, 규칙 발화)를 그때그때 찍고, 끝에 건별 요약(요청·윈도우 수, 이벤트 수, 최대 점수)을 낸다.
+- 청크 크기는 요청 수만 바꾸고 판정은 바꾸지 않는다(서버가 청크 안의 모든 윈도우를 스코어링). 기본으로 건 상태를 지우고(`DELETE /guns/{id}`) 시작한다(`--no-reset`).
+- `replay_file()`은 `httpx.Client`든 FastAPI `TestClient`든 받는다 — `pytest`가 서버 없이 이걸로 돈다.
 
 #### 5.8 품질 관리
 
 - `pytest` → `tests/test_pipeline.py`: 합성 CSV(클래스별 2파일 + 테스트 2파일, 2시간, gap·캡 드레싱·종료 코드 포함)를 임시 폴더에서 2→3→4→4'→`--score`→5단계(`/predict`)까지 돌리고, API 점수가 오프라인 점수와 같은지 확인한다. 학습은 `--warmup-hours 0.5`로 돌려 2시간 파일에서도 건별 워밍업이 끝나게 하고, API가 워밍업 전(`warming_up`, 글로벌 임계값)과 후(`gun`, 건별 임계값·재정규화 점수가 오프라인 `window_file`/`gun_thresholds`와 일치)를 모두 재현하는지 본다. 실데이터 폴더는 건드리지 않는다. 파이프라인 코드를 고치면 이것부터 돌린다.
-- 검증 항목: 번들의 `gun_norm`·`dropped_features`(c19 제외, 46피처)·`alarm_max_non_welding`, 점수 CSV의 `threshold`/`warmup` 열, API의 `alarm_held`(캡 드레싱 구간), `rule_triggered`(종료 코드 → critical), `gun_norm` 전·후 점수 일치.
+- 검증 항목: 번들의 `gun_norm`·`dropped_features`(c19 제외, 46피처)·`alarm_max_non_welding`·`rule`, 점수 CSV의 `threshold`/`warmup` 열, API의 `alarm_held`(캡 드레싱 구간), `rule_triggered`(에피소드 시작 1회, 쿨다운), `gun_norm` 전·후 점수 일치, 요청 크기 한도(422), 시간 기준 지속 알람(10초 청크로 보내도 180초에 critical), 버퍼보다 긴 비용접 구간, `replay.py`로 2시간 파일 재생.
 - 회귀 고정: `test_2b_window_columns`는 윈도우 집계가 연속 피처(24개, 모델 입력은 그중 23개)에만 `_mean`/`_std`를 붙이고 메타데이터 이름은 그대로 두는지 확인한다. 합성 데이터의 캡 드레싱 구간을 **분 경계에서 30초 어긋나게** 만들어, `non_welding`이 `max`(=1)가 아니라 `mean`(=0.5)으로 집계되는지도 함께 검증한다.
 - `ruff check .` 통과 상태. `black .`은 `pyproject.toml` 설정(120자)을 따른다.
 - 실데이터 파이프라인을 다시 돌려야 하는 변경: 전처리 규칙(2단계 코드) → 2·3·4단계 전부. 모델·윈도우만 → 4단계. 서빙만 → 재실행 불필요(`pytest`로 확인).
@@ -659,4 +678,5 @@ g.columns = [f"{a}_{b}" if a in feat_cols and b in ("mean", "std") else a for a,
 5. `c16 = 8.7`(두꺼운 판) 구간은 z-score 입력으로 들어간다. 판 두께가 다른 새 건에서는 오프셋으로 나타날 수 있다(건별 centering이 일부 흡수).
 6. 서빙 윈도우는 트레일링 60초, 학습 윈도우는 분 경계 정렬 — 정확히 맞추려면 서빙도 분 경계로 자른다.
 7. `Benchmark_fixed.py`의 실제 학습 경로는 미검증.
-8. 3절의 하류(온톨로지/RAG 원인 분석, LLM 리포트, Slack)는 미구현. 입력 계약은 5.7의 `AnomalyResult`.
+8. 3절의 하류(온톨로지/RAG 원인 분석, LLM 리포트, Slack)는 미구현. 입력 계약은 5.7의 `AnomalyResult`, 트리거는 `critical_in_request`. 스트림 입력은 `replay.py`로 재현할 수 있다.
+9. 건별 상태(워밍업·버퍼·쿨다운)는 서버 메모리에만 있다 — 재시작하면 6시간 워밍업부터 다시 한다.

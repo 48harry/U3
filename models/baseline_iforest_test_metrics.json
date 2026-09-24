@@ -1,6 +1,6 @@
 {
   "bundle": "C:\\Users\\a0106\\Desktop\\U3\\models\\baseline_iforest.joblib",
-  "created": "2026-09-23T20:43:50",
+  "created": "2026-09-24T13:41:19",
   "threshold": 0.5250890858482461,
   "window": 60,
   "sustain": 3,
@@ -55,11 +55,20 @@
       0.003469043268773301
     ],
     "rule_terminal_code": {
-      "alarm_rate_error_state": 0.012629161882893225,
-      "alarm_rate_terminal_state": 1.0,
-      "n_terminal_windows": 13,
-      "files_with_terminal_code": 8,
-      "rule_lead_min_median": 9.125
+      "codes": [
+        "E012",
+        "E016",
+        "E028",
+        "E029"
+      ],
+      "cooldown_s": 1800,
+      "flag": "terminal_any",
+      "n_triggers": 22,
+      "files_hit": 8,
+      "rule_lead_min_median": 9.183333333333334,
+      "false_triggers_per_day_mean": 0.25125699777723365,
+      "files_with_false_trigger": 4,
+      "files_false_triggers_ok": 8
     },
     "operating_point": {
       "lead_min_target": 30.0,
@@ -69,10 +78,8 @@
       "files_false_runs_ok": 8,
       "files_both_ok": 0,
       "files_with_final_run": 0,
-      "files_with_final_run_with_rule": 0,
       "files_rule_lead_ok": 0,
-      "final_lead_min_median": NaN,
-      "final_lead_min_median_with_rule": NaN
+      "final_lead_min_median": NaN
     },
     "per_class": {
       "E01": {
@@ -108,8 +115,8 @@
         "held_share_of_windows": 0.118389662027833,
         "gun_norm": "gun",
         "threshold": 0.5580216044692639,
-        "final_alarm_run_with_rule_h_before_failure": NaN,
-        "rule_lead_min": 9.15
+        "rule_lead_min": 9.15,
+        "rule_false_triggers_per_day": 0.7178464606181456
       },
       "test_1": {
         "final_alarm_run_starts_h_before_failure": NaN,
@@ -118,8 +125,8 @@
         "held_share_of_windows": 0.009712586719524281,
         "gun_norm": "gun",
         "threshold": 0.5284242471501357,
-        "final_alarm_run_with_rule_h_before_failure": NaN,
-        "rule_lead_min": 9.75
+        "rule_lead_min": 9.75,
+        "rule_false_triggers_per_day": 0.8615016452288363
       },
       "test_2": {
         "final_alarm_run_starts_h_before_failure": NaN,
@@ -128,8 +135,8 @@
         "held_share_of_windows": 0.023686818632309217,
         "gun_norm": "gun",
         "threshold": 0.5250890858482461,
-        "final_alarm_run_with_rule_h_before_failure": NaN,
-        "rule_lead_min": 9.066666666666666
+        "rule_lead_min": 9.066666666666666,
+        "rule_false_triggers_per_day": 0.0
       },
       "test_3": {
         "final_alarm_run_starts_h_before_failure": NaN,
@@ -138,8 +145,8 @@
         "held_share_of_windows": 0.018929633300297323,
         "gun_norm": "gun",
         "threshold": 0.5250890858482461,
-        "final_alarm_run_with_rule_h_before_failure": NaN,
-        "rule_lead_min": 6.616666666666666
+        "rule_lead_min": 9.616666666666667,
+        "rule_false_triggers_per_day": 0.0
       },
       "test_4": {
         "final_alarm_run_starts_h_before_failure": NaN,
@@ -148,8 +155,8 @@
         "held_share_of_windows": 0.0,
         "gun_norm": "gun",
         "threshold": 0.5250890858482461,
-        "final_alarm_run_with_rule_h_before_failure": NaN,
-        "rule_lead_min": 9.216666666666667
+        "rule_lead_min": 9.216666666666667,
+        "rule_false_triggers_per_day": 0.28713858424725824
       },
       "test_5": {
         "final_alarm_run_starts_h_before_failure": NaN,
@@ -158,8 +165,8 @@
         "held_share_of_windows": 0.0527953427682425,
         "gun_norm": "gun",
         "threshold": 0.5250890858482461,
-        "final_alarm_run_with_rule_h_before_failure": NaN,
-        "rule_lead_min": 9.233333333333333
+        "rule_lead_min": 9.233333333333333,
+        "rule_false_triggers_per_day": 0.14356929212362912
       },
       "test_6": {
         "final_alarm_run_starts_h_before_failure": NaN,
@@ -168,8 +175,8 @@
         "held_share_of_windows": 0.10911793855302279,
         "gun_norm": "gun",
         "threshold": 0.5250890858482461,
-        "final_alarm_run_with_rule_h_before_failure": NaN,
-        "rule_lead_min": 9.083333333333334
+        "rule_lead_min": 9.083333333333334,
+        "rule_false_triggers_per_day": 0.0
       },
       "test_7": {
         "final_alarm_run_starts_h_before_failure": NaN,
@@ -178,8 +185,8 @@
         "held_share_of_windows": 0.09294234592445327,
         "gun_norm": "gun",
         "threshold": 0.5250890858482461,
-        "final_alarm_run_with_rule_h_before_failure": NaN,
-        "rule_lead_min": 9.1
+        "rule_lead_min": 9.1,
+        "rule_false_triggers_per_day": 0.0
       }
     },
     "files": [
@@ -204,5 +211,5 @@
     },
     "class_source": "inferred by preprocess.py from the terminal code in the last 10 min"
   },
-  "evaluated": "2026-09-23T20:44:23"
+  "evaluated": "2026-09-24T13:41:59"
 }

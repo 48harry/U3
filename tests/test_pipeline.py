@@ -161,6 +161,11 @@ def test_3_train_and_evaluate(workspace):
     for v in metrics["metrics"]["test"]["per_file"].values():
         assert v["gun_norm"] == "gun" and v["threshold"] >= metrics["threshold"]
     assert metrics["metrics"]["val"]["auroc"] > 0.5, "the drifting c5 in the pre-failure window must be detectable"
+    # terminal-code rule, evaluated as main.py fires it: one trigger per file (the code starts 300 s before failure)
+    rule = metrics["metrics"]["test"]["rule_terminal_code"]
+    assert rule["flag"] == "terminal_any" and rule["n_triggers"] == 2 and rule["files_hit"] == 2
+    assert rule["files_with_false_trigger"] == 0 and 4 <= rule["rule_lead_min_median"] <= 5
+    assert metrics["rule"] == {"codes": ["E012", "E016", "E028", "E029"], "cooldown_s": 1800}
 
     out = run(os.path.join(PY, "train.py"), "--evaluate", "--data-dir", workspace["pre"], "--model-dir", workspace["models"])
     assert "saved" in out
@@ -186,6 +191,17 @@ def test_3_train_and_evaluate(workspace):
     out = run(os.path.join(PY, "train.py"), "--score", str(workspace["pre"] / "test" / "test_1.parquet"),
               "--model-dir", workspace["models"])
     assert "windows, alarm rate" in out
+
+
+def test_3b_rule_triggers():
+    """The rule fires on an episode start (0 -> 1) and then keeps quiet for the cooldown."""
+    from train import rule_triggers
+
+    flags = np.array([0, 1, 1, 0, 1, 0, 0, 1])
+    ttf = np.arange(len(flags))[::-1] * 60.0
+    assert np.flatnonzero(rule_triggers(flags, ttf, cooldown_s=1800)).tolist() == [1]
+    assert np.flatnonzero(rule_triggers(flags, ttf, cooldown_s=60)).tolist() == [1, 4, 7]
+    assert np.flatnonzero(rule_triggers(flags, ttf, cooldown_s=240)).tolist() == [1, 7]
 
 
 def test_4_api_matches_offline(workspace):
@@ -255,12 +271,17 @@ def test_4_api_matches_offline(workspace):
         assert all(c["value"] == 0 for c in res["contributing_features"] if c["sensor"] in ("c7", "c8", "c9"))
 
         # the failure end: terminal code -> class hint for the ontology stage
-        r = client.post("/predict", json={"gun_id": "G2", "readings": raw.iloc[-1500:].to_dict("records")})
+        r = client.post("/predict", json={"gun_id": "G2", "readings": raw.iloc[-1500:-750].to_dict("records")})
+        assert r.status_code == 200 and r.json()["rule_triggered"] is False
+        r = client.post("/predict", json={"gun_id": "G2", "readings": raw.iloc[-750:].to_dict("records")})
         assert r.status_code == 200 and r.json()["context"]["known_code_class_hint"] == "E04"
         assert r.json()["context"]["latest_error_code"] == "E029"
         # terminal-code rule: severity is critical whatever the model says
         assert r.json()["rule_triggered"] is True and r.json()["severity"] == "critical"
-        assert r.json()["severity_source"] in ("rule", "model+rule")
+        assert r.json()["severity_source"] in ("rule", "model+rule") and r.json()["critical_in_request"] is True
+        assert pd.Timestamp(r.json()["rule_trigger_time"]) == pd.Timestamp(raw["time"].iloc[-300]).tz_localize(None)
+        assert r.json()["rule_code"] == "E029" and r.json()["rule_class_hint"] == "E04"
+        assert r.json()["windows_scored"] == 13, "a window every 60 s back from the latest row: ceil(750 / 60)"
         assert res["rule_triggered"] is False and res["severity_source"] in ("none", "model")
 
         # a window inside the cap-dressing block: alarms are held, never counted, severity stays normal
@@ -274,3 +295,87 @@ def test_4_api_matches_offline(workspace):
         assert {g["gun_id"] for g in client.get("/guns").json()} == {"G1", "G2", "G3"}
         assert client.delete("/guns/G1").status_code == 204
         assert client.delete("/guns/G1").status_code == 404
+
+
+def test_5_api_chunks_sustain_rule(workspace):
+    """Chunk limit, time-based sustained alarm, and the edge-triggered terminal-code rule with cooldown."""
+    os.environ["RSW_MODEL_PATH"] = str(workspace["models"] / "baseline_iforest.joblib")
+    sys.path.insert(0, ROOT)
+    main = importlib.reload(importlib.import_module("main"))
+    from fastapi.testclient import TestClient
+
+    raw = pd.read_csv(workspace["test"] / "test_0.csv", dtype={"c10": str, "error": str})
+
+    def post(client, gun, part):
+        return client.post("/predict", json={"gun_id": gun, "readings": part.to_dict("records")})
+
+    with TestClient(main.app) as client:
+        # a chunk larger than the buffer minus 10 min of history is refused, not silently truncated
+        assert main.MAX_CHUNK == 1200
+        assert post(client, "big", raw.iloc[:1201]).status_code == 422
+
+        d = main.app.state.detector
+        thr = d.threshold
+        d.threshold = -1e9  # every window alarms (all guns below are still in their warm-up -> global threshold)
+        try:
+            # one 1170-row chunk: every window is scored, the run is long enough -> sustained
+            res = post(client, "S1", raw.iloc[:1170]).json()
+            assert res["windows_scored"] == 19 and res["consecutive_alarms"] == 19
+            assert res["sustained_alarm"] is True and res["severity"] == "critical" and res["alarm_duration_s"] >= 1100
+            # 10 s chunks: windows overlap, so 3 consecutive alarming requests are only 80 s of alarm -
+            # sustained needs sustain x window = 180 s of continuous alarm, whatever the call rate
+            first, sustained_at = None, None
+            for i in range(0, 400, 10):
+                r = post(client, "S2", raw.iloc[i: i + 10])
+                if r.status_code != 200:
+                    continue
+                res = r.json()
+                first = first or pd.Timestamp(res["window_start"])
+                if res["sustained_alarm"]:
+                    sustained_at = pd.Timestamp(res["window_end"])
+                    assert res["consecutive_alarms"] > 3
+                    break
+            assert sustained_at is not None and 179 <= (sustained_at - first).total_seconds() < 190
+        finally:
+            d.threshold = thr
+
+        # the rule fires once per episode start and is quiet during the cooldown, even if the code comes back
+        part = raw.iloc[:600].copy()
+        part.loc[150:199, "error"] = "E029"  # a cross-class E029 flap long before the failure
+        part.loc[250:299, "error"] = "E029"
+        triggers, active = [], 0
+        for i in range(0, 600, 60):
+            r = post(client, "R1", part.iloc[i: i + 60])
+            if r.status_code == 200:
+                res = r.json()
+                triggers.append(res["rule_triggered"])
+                active += res["rule_code_active"]
+                if res["rule_triggered"]:
+                    assert res["critical_in_request"] and res["severity"] == "critical" and res["context"]["known_code_class_hint"] == "E04"
+                elif not res["sustained_alarm"]:
+                    assert res["severity"] != "critical", "a persisting terminal code alone is not critical"
+        assert sum(triggers) == 1 and active >= 1
+
+        # a cap-dressing block longer than the 30-min buffer: the non-welding rows keep carrying the last welding
+        # values (regression: the buffer held no welding row any more -> NaN features -> HTTP 500 on real test_0)
+        assert post(client, "CD", raw.iloc[:1200]).status_code == 200
+        for a, b in ((1200, 2390), (2390, 3590)):
+            r = post(client, "CD", raw.iloc[a:b].assign(c16=0.0))
+            assert r.status_code == 200, r.text
+        res = r.json()
+        assert res["context"]["non_welding_share"] == 1.0 and res["alarm_held"] is True
+        assert np.isfinite(res["anomaly_score"])
+        # a stream that starts in non-welding has nothing to carry yet -> 202, not 500
+        r = post(client, "CD0", raw.iloc[:120].assign(c16=0.0))
+        assert r.status_code == 202 and "no welding row" in r.json()["message"]
+
+        # replay client: the whole 2 h test file in 5-min chunks -> one rule event (the terminal code at the end)
+        from replay import replay_file
+
+        s = replay_file(client, str(workspace["test"] / "test_0.csv"), "RP", chunk_s=300)
+        assert s["requests"] == 24 and s["rule_triggers"] == 1
+        rule_events = [e for e in s["critical_events"] if e["rule_trigger_time"]]
+        assert len(rule_events) == 1 and rule_events[0]["class_hint"] == "E04" and "rule" in rule_events[0]["severity_source"]
+        assert s["windows_scored"] >= 100 and s["last"]["gun_norm"] == "gun"
+        with pytest.raises(ValueError):
+            replay_file(client, str(workspace["test"] / "test_0.csv"), "RP", chunk_s=1201)

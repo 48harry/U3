@@ -52,6 +52,9 @@ ROLL_S = int(pd.Timedelta(ROLL).total_seconds())  # 10-minute rolling features, 
 # defaults for bundles written before preprocess_config was stored; a current bundle overrides them
 DEFAULT_PREPROCESS = {"gap_fill_limit": 60, "outlier_hi": 5.0, "outlier_lo": 0.0, "resample": None}
 BUFFER_S = 1800  # per-gun history kept in memory (>= ROLL_S + window + gap limit)
+# a request may not carry more rows than fit in the buffer next to 10 min of history: the rolling
+# features of its first row need that history, and rows beyond the buffer would be dropped silently
+MAX_CHUNK = BUFFER_S - ROLL_S
 TOP_K_FEATURES = 8
 CODE_TO_CLASS = TERMINAL_TO_CLASS  # E012 -> E01 ...
 FaultClass = Literal["E01", "E02", "E03", "E04"]
@@ -124,8 +127,10 @@ class SensorReading(BaseModel):
 class PredictRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     gun_id: str = Field(min_length=1, max_length=64, description="welding gun identifier")
-    readings: list[SensorReading] = Field(min_length=1, max_length=3600,
-                                          description="new samples, any order; appended to the gun's buffer")
+    readings: list[SensorReading] = Field(
+        min_length=1, max_length=MAX_CHUNK,
+        description=f"new samples, any order; appended to the gun's buffer. At most {MAX_CHUNK} (the 30-min buffer minus "
+                    "10 min of rolling history); every completed window in the chunk is scored")
 
 
 # ============================================================ output schema
@@ -166,6 +171,7 @@ class ModelInfo(BaseModel):
         "none", description="per-gun re-normalisation after the warm-up: center = subtract the gun mean, scale = also divide by its std")
     gun_warmup_s: int | None = Field(None, description="warm-up length per gun stream")
     gun_threshold_q: float | None = Field(None, description="quantile of the warm-up scores used as the gun's threshold (None = global)")
+    rule_cooldown_s: int = Field(description="after a terminal-code rule trigger the rule stays quiet this long per gun")
 
 
 class AnomalyResult(BaseModel):
@@ -200,14 +206,28 @@ class AnomalyResult(BaseModel):
     gun_threshold: float | None = Field(None, description="this gun's threshold once its warm-up is over (None otherwise)")
     score_z: float = Field(description="(score - normal mean) / normal std on training windows")
     severity: Literal["normal", "warning", "critical"] = Field(
-        description="normal: below threshold or held; warning: above; critical: `sustain` consecutive windows above, "
-                    "OR the terminal-code rule fired (rule_triggered)")
-    rule_triggered: bool = Field(False, description="the latest error code is a class's terminal code (E012/E016/E028/E029): "
-                                                    "severity is forced to critical regardless of the model")
+        description="normal: below threshold or held; warning: above; critical: sustained alarm (above threshold for "
+                    ">= sustain x window seconds), OR the terminal-code rule fired in this request (rule_triggered)")
+    rule_triggered: bool = Field(False, description="a terminal-code episode (E012/E016/E028/E029) STARTED in this request's "
+                                                    "rows and the gun's rule cooldown had expired: severity is forced to "
+                                                    "critical regardless of the model. Fires once per episode, not while "
+                                                    "the code persists")
+    rule_trigger_time: datetime | None = Field(None, description="timestamp of the row that fired the rule")
+    rule_code: str | None = Field(None, description="the terminal code that fired the rule (it may have cleared by window_end)")
+    rule_class_hint: FaultClass | None = Field(None, description="fault class of rule_code - use this, not "
+                                                                 "context.known_code_class_hint, when rule_triggered")
+    rule_code_active: bool = Field(False, description="the latest error code is a terminal code (a state, not a trigger)")
     severity_source: Literal["model", "rule", "model+rule", "none"] = Field(
         "none", description="what made severity critical: the model's sustained alarm, the terminal-code rule, or both")
-    sustained_alarm: bool
-    consecutive_alarms: int
+    sustained_in_request: bool = Field(False, description="some window of this request had a sustained model alarm")
+    sustained_alarm: bool = Field(description="the model has alarmed continuously for >= sustain x window seconds "
+                                              "(time-based: independent of how often the client calls)")
+    consecutive_alarms: int = Field(description="consecutive alarming windows scored (they overlap when calls are < window apart)")
+    alarm_duration_s: int = Field(0, description="seconds of continuous alarm up to window_end (0 = no alarm)")
+    windows_scored: int = Field(1, description="windows scored for this request: every completed window since the previous "
+                                               "request (spaced window_s apart, ending at the latest row)")
+    critical_in_request: bool = Field(False, description="some window of this request was critical (a sustained alarm "
+                                                         "or a rule trigger) - even if the latest window is not")
     contributing_features: list[FeatureContribution] = Field(description="top features by contribution, descending")
     context: WindowContext
     model: ModelInfo
@@ -276,12 +296,15 @@ class Detector:
         self.reference = np.asarray(ref, dtype=np.float32) if ref else np.zeros(len(self.model_cols), np.float32)
         if not ref:
             log.warning("bundle has no feature_reference (retrain with the current train.py); using zeros")
+        rule = b.get("rule") or {"codes": list(trainlib.TERMINAL_CODES), "cooldown_s": trainlib.RULE_COOLDOWN_S}
+        self.rule_codes: list[str] = list(rule["codes"])
+        self.rule_cooldown_s: int = int(rule["cooldown_s"])
         self.info = ModelInfo(name=os.path.splitext(os.path.basename(path))[0], type=str(b.get("model_type", "?")),
                               created=str(b.get("created", "?")), window_s=self.window, threshold=self.threshold,
                               threshold_q=float(b.get("threshold_q", float("nan"))), sustain=self.sustain,
                               n_features=len(self.model_cols), alarm_max_non_welding=self.alarm_max_non_welding,
                               gun_norm=(gn or {}).get("mode", "none"), gun_warmup_s=(gn or {}).get("warmup_s"),
-                              gun_threshold_q=(gn or {}).get("threshold_q"))
+                              gun_threshold_q=(gn or {}).get("threshold_q"), rule_cooldown_s=self.rule_cooldown_s)
 
     # ---- per-gun normalisation, the online counterpart of train.window_file()
     def gun_normalise(self, g: "GunState", f: pd.DataFrame) -> tuple[pd.DataFrame, float]:
@@ -339,8 +362,45 @@ class Detector:
                 g.gun_threshold = float(max(self.threshold, np.quantile(s, float(q))))
         g.norm_status = "gun"
 
+    def window_threshold(self, g: "GunState", window_start: pd.Timestamp) -> float:
+        """The gun's own threshold for windows entirely after its warm-up, the global one otherwise
+        (train.window_thresholds: warm-up windows are judged with the global threshold)."""
+        if g.norm_status == "gun" and g.gun_threshold is not None and window_start >= g.norm["t_end"]:
+            return g.gun_threshold
+        return self.threshold
+
+    # ---- terminal-code rule: fires on an episode start, then keeps quiet for rule_cooldown_s
+    def rule_check(self, g: "GunState", code: pd.Series) -> tuple[pd.Timestamp, str] | None:
+        """Scan the rows not seen yet; return (time, code) of the first trigger, None if the rule did not fire."""
+        new = code[code.index > g.rule_seen] if g.rule_seen is not None else code
+        if new.empty:
+            return None
+        prev = new.shift(fill_value=g.rule_prev_code)
+        onset = new.isin(self.rule_codes) & (new != prev)
+        fired = None
+        for t in new.index[onset.to_numpy()]:
+            if g.rule_last_trigger is None or (t - g.rule_last_trigger).total_seconds() >= self.rule_cooldown_s:
+                g.rule_last_trigger = t
+                fired = fired or (t, str(new.loc[t]))
+        g.rule_seen, g.rule_prev_code = new.index[-1], str(new.iloc[-1])
+        return fired
+
+    def window_ends(self, g: "GunState", f: pd.DataFrame) -> list[int]:
+        """Row positions of the window ends to score, chronological: the latest row, then every `window`
+        rows back, down to the previous request's last window (same segment) or the segment start."""
+        last_end = g.last_end if g.last_end is not None and g.last_end >= f.index[0] else None
+        ends, pos = [], len(f) - 1
+        while pos >= self.window - 1 and (last_end is None or f.index[pos] > last_end):
+            ends.append(pos)
+            pos -= self.window
+        return ends[::-1] or [len(f) - 1]  # nothing new (a resend): re-score the latest window
+
     # ---- preprocessing identical in spirit to preprocess.py, on a rolling buffer
-    def features(self, raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series] | None:
+    def features(self, raw: pd.DataFrame, carry: pd.Series | None = None) -> tuple[pd.DataFrame, pd.Series | None] | None:
+        """Buffer rows -> (feature frame of the last contiguous segment, sensor values of the latest welding row).
+        `carry` = the latest welding row seen by an earlier request: non-welding rows take the last welding value
+        however long ago it was (preprocess.py), and a cap-dressing block can outlast the 30-min buffer.
+        None when nothing can be filled yet (the stream has not shown a single welding row)."""
         df = raw.set_index("time").sort_index()
         df = df[~df.index.duplicated(keep="last")]
         raw_index = df.index
@@ -358,8 +418,15 @@ class Detector:
         non_welding = x["c16"] <= self.outlier_lo
         if self.outlier_hi is not None:
             non_welding |= x["c16"] > self.outlier_hi
-        x.loc[non_welding, VALUE_COLS + [BINARY_COL]] = np.nan
+        held_cols = VALUE_COLS + [BINARY_COL]
+        welding = ~non_welding
+        carry = x.loc[welding, held_cols].iloc[-1] if welding.any() else carry
+        x.loc[non_welding, held_cols] = np.nan
+        if carry is not None and non_welding.iloc[0]:
+            x.iloc[0, x.columns.get_indexer(held_cols)] = carry[held_cols].to_numpy()
         x = x.ffill().bfill()
+        if x[held_cols].isna().any().any():
+            return None
 
         f = pd.DataFrame(index=x.index)
         f["welds_delta"] = x["c11"].diff().fillna(0).clip(lower=0)
@@ -376,7 +443,7 @@ class Detector:
             if c in f.columns:
                 f[c] = (f[c] - p["mean"]) / p["std"]
         f["error_active"], f["non_welding"], f["error_code"] = error_active, non_welding.astype("float32"), code
-        return f, error_active, non_welding
+        return f, carry
 
     def window_vector(self, f: pd.DataFrame) -> np.ndarray:
         w = f.iloc[-self.window:]
@@ -407,6 +474,15 @@ class GunState:
         self.lock = asyncio.Lock()
         self.consecutive_alarms = 0
         self.last_score: float | None = None
+        # time-based sustained alarm: start of the current alarm run, end of the last scored window
+        self.alarm_since: pd.Timestamp | None = None
+        self.last_end: pd.Timestamp | None = None
+        # terminal-code rule: last row seen, its code, time of the last trigger (cooldown)
+        self.rule_seen: pd.Timestamp | None = None
+        self.rule_prev_code = "0"
+        self.rule_last_trigger: pd.Timestamp | None = None
+        # sensor values of the latest welding row: what non-welding rows carry once it has left the buffer
+        self.carry: pd.Series | None = None
         # per-gun normalisation: rows collected during the warm-up, then the fixed statistics
         self.norm_status: str = "warming_up" if gun_norm else "global"
         self.t0: pd.Timestamp | None = None
@@ -468,28 +544,44 @@ async def predict(req: PredictRequest, request: Request) -> AnomalyResult | JSON
             row = r.model_dump()
             row[BINARY_COL] = 1.0 if row[BINARY_COL] else 0.0
             g.rows.append(row)
-        out = d.features(g.frame())
+        out = d.features(g.frame(), g.carry)
+        if out is not None:
+            g.carry = out[1]
+        rule = d.rule_check(g, out[0]["error_code"]) if out is not None else None
         if out is None or len(out[0]) < d.window:
             n = 0 if out is None else len(out[0])
             body = WarmingUp(gun_id=req.gun_id, n_samples=n, samples_needed=d.window,
-                             message=f"need {d.window} contiguous 1 Hz samples, have {n}")
+                             message=f"need {d.window} contiguous 1 Hz samples, have {n}" if out is not None else
+                             "no welding row seen yet: non-welding rows (c16 <= 0) carry the last welding values")
             return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=body.model_dump())
-        f, error_active, non_welding = out
-        f, threshold = d.gun_normalise(g, f)
-        vec = d.window_vector(f)
-        score, feats = d.score(vec)
-        w = f.iloc[-d.window:]
-        nw_share = float(w["non_welding"].mean())
-        is_anomaly = score > threshold
-        held = d.alarm_max_non_welding is not None and nw_share > d.alarm_max_non_welding
-        alarm = is_anomaly and not held
-        g.consecutive_alarms = g.consecutive_alarms + 1 if alarm else 0
+        f, _ = d.gun_normalise(g, out[0])
+        ends = d.window_ends(g, f)
+        if g.last_end is None or g.last_end < f.index[0]:  # first request or after a long gap: a new alarm run
+            g.alarm_since, g.consecutive_alarms = None, 0
+        fresh = g.last_end is None or f.index[ends[-1]] > g.last_end
+        vecs = np.stack([d.window_vector(f.iloc[: e + 1]) for e in ends])
+        scores = trainlib.anomaly_score(d.model, vecs)
+        sustained_in_request = False
+        for e, sc in zip(ends, scores):  # chronological: advance the alarm state window by window
+            w = f.iloc[e - d.window + 1: e + 1]
+            threshold = d.window_threshold(g, w.index[0])
+            nw_share = float(w["non_welding"].mean())
+            is_anomaly = bool(sc > threshold)
+            held = d.alarm_max_non_welding is not None and nw_share > d.alarm_max_non_welding
+            alarm = is_anomaly and not held
+            if fresh:
+                g.consecutive_alarms = g.consecutive_alarms + 1 if alarm else 0
+                g.alarm_since = (g.alarm_since or w.index[0]) if alarm else None
+                g.last_end = w.index[-1]
+            duration = int((w.index[-1] - g.alarm_since).total_seconds()) + 1 if alarm and g.alarm_since is not None else 0
+            sustained = duration >= d.sustain * d.window
+            sustained_in_request |= sustained
+        score, feats = d.score(vecs[-1])  # the latest window, with feature attributions
         g.last_score = score
-        sustained = g.consecutive_alarms >= d.sustain
         latest_code = str(w["error_code"].iloc[-1])
-        # terminal-code rule (history.md P2-1): the model scores the terminal state below threshold, the
-        # ontology stage must still be triggered - the rule forces critical, independent of the model
-        rule_hit = CODE_TO_CLASS.get(latest_code) is not None
+        # terminal-code rule (history.md P2-1 / MVP review): the model scores the terminal state below threshold, so
+        # the rule forces critical - once per episode start, then quiet for rule_cooldown_s
+        rule_hit = rule is not None
         severity = "critical" if (sustained or rule_hit) else "warning" if alarm else "normal"
         severity_source = ("model+rule" if sustained and rule_hit else "model" if sustained else "rule" if rule_hit else "none")
         ctx = WindowContext(latest_error_code=latest_code,
@@ -503,13 +595,18 @@ async def predict(req: PredictRequest, request: Request) -> AnomalyResult | JSON
                             known_code_class_hint=CODE_TO_CLASS.get(latest_code))
         return AnomalyResult(
             gun_id=req.gun_id, window_start=w.index[0].to_pydatetime(), window_end=w.index[-1].to_pydatetime(),
-            n_samples=int(len(w)), history_s=int(len(f)), is_anomaly=bool(is_anomaly), anomaly_score=score,
+            n_samples=int(len(w)), history_s=int(len(f)), is_anomaly=is_anomaly, anomaly_score=score,
             alarm_held=bool(held),
             hold_reason=f"non_welding_share {nw_share:.2f} > gate {d.alarm_max_non_welding}" if held else None,
             threshold=threshold, gun_norm=g.norm_status, gun_threshold=g.gun_threshold,
             score_z=(score - d.score_mean) / d.score_std,
-            severity=severity, rule_triggered=rule_hit, severity_source=severity_source,
-            sustained_alarm=sustained, consecutive_alarms=g.consecutive_alarms,
+            severity=severity, rule_triggered=rule_hit,
+            rule_trigger_time=rule[0].to_pydatetime() if rule_hit else None,
+            rule_code=rule[1] if rule_hit else None, rule_class_hint=CODE_TO_CLASS.get(rule[1]) if rule_hit else None,
+            rule_code_active=latest_code in d.rule_codes, severity_source=severity_source,
+            sustained_alarm=sustained, consecutive_alarms=g.consecutive_alarms, alarm_duration_s=duration,
+            windows_scored=len(ends), sustained_in_request=sustained_in_request,
+            critical_in_request=sustained_in_request or rule_hit,
             contributing_features=feats, context=ctx, model=d.info)
 
 

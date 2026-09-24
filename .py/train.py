@@ -31,10 +31,11 @@ Eval  : on validation files - AUROC / AUPRC of pre-failure vs normal windows, pe
         failure) starts, and the number of sustained false-alarm runs per day > 24 h earlier.
         Every evaluation also reports (a) the OPERATING POINT: how many files get a final alarm
         run >= OP_LEAD_MIN minutes before the failure and <= OP_FALSE_RUNS false runs per day,
-        (b) the TERMINAL-CODE RULE as a baseline: a window whose error code is the class's
-        terminal code (E012/E016/E028/E029) is an alarm regardless of the model - what main.py
-        does with `known_code_class_hint`. --label-window relabels the pre-failure window
-        (default: the 3600 s preprocess.py used), --cv k adds a gun-level k-fold estimate.
+        (b) the TERMINAL-CODE RULE as a baseline, exactly as main.py fires it: any class's terminal
+        code (E012/E016/E028/E029), once per episode start, then a RULE_COOLDOWN_S cooldown - hits
+        (lead of the first trigger inside the pre-failure window) and false triggers per day.
+        --label-window relabels the pre-failure window (default: the 3600 s preprocess.py used),
+        --cv k adds a gun-level k-fold estimate.
 Test  : the 8 held-out files (preprocess.py --split test -> preprocessed/test/) get the same
         evaluation, with the SAME threshold, after training (metrics["test"]) or on their own
         with --evaluate (loads the saved bundle, writes models/baseline_<model>_test_metrics.json
@@ -75,8 +76,14 @@ CLASSES = ["E01", "E02", "E03", "E04"]
 OP_LEAD_MIN = 30.0
 OP_FALSE_RUNS = 1.0
 META_COLS = {"file", "class", "gun", "error_code", "segment_id", "dow", "ttf_s", "label",
-             "error_active", "terminal_code", "non_welding", "warmup", "gun_norm"}
-FLAG_COLS = ["error_active", "terminal_code", "non_welding", "label", "warmup"]
+             "error_active", "terminal_code", "terminal_any", "non_welding", "warmup", "gun_norm"}
+FLAG_COLS = ["error_active", "terminal_code", "terminal_any", "non_welding", "label", "warmup"]
+# terminal-code rule, as main.py applies it: ANY class's terminal code counts (the serving layer does not know
+# the gun's class), and it fires once when a terminal-code episode starts, then stays quiet for
+# RULE_COOLDOWN_S. E029 in particular also shows up for hours in E01-E03 guns days before their failure, so
+# a state-based rule (critical as long as the code is present) would page for hours.
+TERMINAL_CODES = ("E012", "E016", "E028", "E029")
+RULE_COOLDOWN_S = 1800
 # c19 ("offset value in robot") is a counter that grows ~55/s through every file. Every file is
 # exactly 7 days long and ends at its failure, so within a file c19 == time since start ==
 # 168 h - time to failure: a label leak, not a measurement (a supervised model reaches AUROC 0.98
@@ -93,6 +100,8 @@ def feature_columns(df, drop=()):
 def window_features(df, window, feat_cols=None):
     """1 Hz rows -> one row per (segment, window): mean & std of features, max of flags, min ttf."""
     feat_cols = feat_cols or feature_columns(df)
+    if "error_code" in df.columns:
+        df = df.assign(terminal_any=df["error_code"].isin(TERMINAL_CODES).astype("float32"))
     agg = {c: ["mean", "std"] for c in feat_cols}
     agg.update({c: "max" for c in FLAG_COLS if c in df.columns})
     agg["non_welding"] = "mean"  # share of the window, not a 0/1 flag like the others
@@ -262,6 +271,18 @@ def alarm_timing(alarm, ttf_s, sustain, normal_before_h=24):
     return final_start_h, n_false / normal_days
 
 
+def rule_triggers(terminal, ttf_s, cooldown_s=RULE_COOLDOWN_S):
+    """Chronological per-window terminal-code flags -> mask of the windows where the rule fires: a
+    terminal-code episode starts (0 -> 1) and the previous trigger is >= cooldown_s earlier (main.py)."""
+    t = np.asarray(terminal) > 0
+    onset = t & ~np.concatenate([[False], t[:-1]])
+    out, last = np.zeros(len(t), dtype=bool), None
+    for i in np.flatnonzero(onset):
+        if last is None or ttf_s[last] - ttf_s[i] >= cooldown_s:
+            out[i], last = True, i
+    return out
+
+
 def evaluate(val, scores, threshold, sustain, gate=None, gun_thr=None):
     """threshold: the global one; gun_thr: file -> per-gun threshold (applied after the warm-up)."""
     normal = (val["label"] == 0) & (val["error_active"] == 0)
@@ -311,35 +332,42 @@ def evaluate(val, scores, threshold, sustain, gate=None, gun_thr=None):
                        "threshold": float((gun_thr or {}).get(f, threshold))}
     rates = np.array([v["alarm_rate_normal"] for v in per_file.values()])
     m["alarm_rate_normal_per_file_min_max_std"] = [float(rates.min()), float(rates.max()), float(rates.std())]
-    # terminal-code rule (main.py's known_code_class_hint) as a model-free baseline / safety net
-    rule = val["terminal_code"].to_numpy() > 0 if "terminal_code" in val.columns else np.zeros(len(val), dtype=bool)
-    err = (val["error_active"] == 1).to_numpy()
-    a_rule = a | rule
+    # terminal-code rule exactly as main.py fires it (any class's code, episode start, cooldown) - a
+    # model-free baseline / safety net. Hit = the first trigger inside the pre-failure window (its lead);
+    # false triggers = triggers before that window, per day.
+    tcol = "terminal_any" if "terminal_any" in val.columns else "terminal_code"
+    terminal = val[tcol].to_numpy() if tcol in val.columns else np.zeros(len(val))
+    ttf, n_trig = val["ttf_s"].values, 0
     for f, idx in val.groupby("file").indices.items():
-        order = idx[np.argsort(-val["ttf_s"].values[idx])]
-        final_rule_h, _ = alarm_timing(a_rule[order], val["ttf_s"].values[order], sustain)
-        per_file[f]["final_alarm_run_with_rule_h_before_failure"] = float(final_rule_h)
-        per_file[f]["rule_lead_min"] = float(val["ttf_s"].values[idx][rule[idx]].max() / 60) if rule[idx].any() else np.nan
+        order = idx[np.argsort(-ttf[idx])]
+        trig = rule_triggers(terminal[order], ttf[order])
+        pre_o = pre.values[order]
+        hit = trig & pre_o
+        pre_start = ttf[order][pre_o].max() if pre_o.any() else 0
+        normal_days = max((ttf[order][0] - pre_start) / 86400, 1e-9)
+        n_trig += int(trig.sum())
+        per_file[f]["rule_lead_min"] = float(ttf[order][hit].max() / 60) if hit.any() else np.nan
+        per_file[f]["rule_false_triggers_per_day"] = float((trig & ~pre_o).sum() / normal_days)
+    leads = [v["rule_lead_min"] for v in per_file.values()]
+    false_trig = np.array([v["rule_false_triggers_per_day"] for v in per_file.values()])
     m["rule_terminal_code"] = {
-        "alarm_rate_error_state": float(a_rule[err].mean()) if err.any() else np.nan,
-        "alarm_rate_terminal_state": float(a_rule[rule].mean()) if rule.any() else np.nan,
-        "n_terminal_windows": int(rule.sum()),
-        "files_with_terminal_code": int(sum(1 for v in per_file.values() if v["rule_lead_min"] == v["rule_lead_min"])),
-        "rule_lead_min_median": float(np.nanmedian([v["rule_lead_min"] for v in per_file.values()]))}
+        "codes": list(TERMINAL_CODES), "cooldown_s": RULE_COOLDOWN_S, "flag": tcol, "n_triggers": n_trig,
+        "files_hit": int(sum(1 for v in leads if v == v)),
+        "rule_lead_min_median": float(np.nanmedian(leads)) if any(v == v for v in leads) else np.nan,
+        "false_triggers_per_day_mean": float(false_trig.mean()),
+        "files_with_false_trigger": int((false_trig > 0).sum()),
+        "files_false_triggers_ok": int((false_trig <= OP_FALSE_RUNS).sum())}
     # operating point
     lead = np.nan_to_num(np.array([v["final_alarm_run_starts_h_before_failure"] for v in per_file.values()]) * 60, nan=-1)
-    lead_rule = np.nan_to_num(np.array([v["final_alarm_run_with_rule_h_before_failure"] for v in per_file.values()]) * 60, nan=-1)
     false_runs = np.array([v["false_alarm_runs_per_day"] for v in per_file.values()])
     m["operating_point"] = {
         "lead_min_target": OP_LEAD_MIN, "false_runs_per_day_target": OP_FALSE_RUNS, "files": len(per_file),
         "files_lead_ok": int((lead >= OP_LEAD_MIN).sum()), "files_false_runs_ok": int((false_runs <= OP_FALSE_RUNS).sum()),
         "files_both_ok": int(((lead >= OP_LEAD_MIN) & (false_runs <= OP_FALSE_RUNS)).sum()),
-        "files_with_final_run": int((lead >= 0).sum()), "files_with_final_run_with_rule": int((lead_rule >= 0).sum()),
-        # the rule alone: first terminal-code window before the failure (the code often clears before the last row,
-        # so a rule "run" need not touch the end of the file - judge the rule by its lead, not by the run)
+        "files_with_final_run": int((lead >= 0).sum()),
+        # the rule alone: judged by its lead (first trigger inside the pre-failure window), not by a run
         "files_rule_lead_ok": int(sum(1 for v in per_file.values() if v["rule_lead_min"] >= OP_LEAD_MIN)),
-        "final_lead_min_median": float(np.median(lead[lead >= 0])) if (lead >= 0).any() else np.nan,
-        "final_lead_min_median_with_rule": float(np.median(lead_rule[lead_rule >= 0])) if (lead_rule >= 0).any() else np.nan}
+        "final_lead_min_median": float(np.median(lead[lead >= 0])) if (lead >= 0).any() else np.nan}
     m["per_class"], m["per_file"] = per_class, per_file
     return m
 
@@ -378,9 +406,12 @@ def print_metrics(tag, v):
     if op and rule:
         print(f"  operating point (lead >= {op['lead_min_target']:.0f} min, false runs <= {op['false_runs_per_day_target']:.0f}/day): "
               f"{op['files_both_ok']}/{op['files']} files (lead ok {op['files_lead_ok']}, false runs ok {op['files_false_runs_ok']}); "
-              f"final run in {op['files_with_final_run']} files (median lead {op['final_lead_min_median']:.1f} min); "
-              f"with terminal-code rule: {op['files_with_final_run_with_rule']} files, median lead "
-              f"{op['final_lead_min_median_with_rule']:.1f} min, error-state alarm rate {rule['alarm_rate_error_state']:.3f}")
+              f"final run in {op['files_with_final_run']} files (median lead {op['final_lead_min_median']:.1f} min)")
+        print(f"  terminal-code rule (any code, episode start, {rule['cooldown_s'] // 60} min cooldown): "
+              f"{rule['files_hit']}/{op['files']} files hit, median lead {rule['rule_lead_min_median']:.1f} min; "
+              f"false triggers {rule['false_triggers_per_day_mean']:.2f}/day/file "
+              f"({rule['files_with_false_trigger']} files with any, {rule['files_false_triggers_ok']} files <= "
+              f"{op['false_runs_per_day_target']:.0f}/day)")
 
 
 def test_files_in(test_dir):
@@ -417,7 +448,7 @@ def evaluate_test(model, feat_cols, model_cols, window, threshold, sustain, file
         test_w = test_w.assign(score=scores, alarm=alarm_mask(scores, thr, test_w["non_welding"].values, gate),
                                threshold=thr)
         for f, part in test_w.groupby("file"):
-            cols = ["score", "alarm", "threshold"] + [c for c in ("ttf_s", "label", "error_active", "non_welding", "warmup")
+            cols = ["score", "alarm", "threshold"] + [c for c in ("ttf_s", "label", "error_active", "terminal_any", "non_welding", "warmup")
                                                      if c in part.columns]
             part[cols].to_csv(os.path.join(score_dir, f"{f}_{tag}.csv"))
     return m
@@ -440,7 +471,7 @@ def score_frame(bundle, df):
     alarm = alarm_mask(s, thr, w["non_welding"].values if "non_welding" in w.columns else None,
                        bundle.get("alarm_max_non_welding"))
     out = pd.DataFrame({"score": s, "alarm": alarm, "threshold": thr}, index=w.index)
-    for c in ("ttf_s", "label", "error_active", "non_welding", "warmup"):
+    for c in ("ttf_s", "label", "error_active", "terminal_any", "non_welding", "warmup"):
         if c in w.columns:
             out[c] = w[c].values
     return out
@@ -637,6 +668,8 @@ def main():
         "model": model, "model_type": args.model, "feature_cols": feat_cols, "model_cols": model_cols,
         "window": args.window, "threshold": threshold, "threshold_q": args.threshold_q, "sustain": args.sustain,
         "alarm_max_non_welding": args.alarm_max_non_welding,
+        # terminal-code rule (main.py fires it on an episode start, then keeps quiet for cooldown_s)
+        "rule": {"codes": list(TERMINAL_CODES), "cooldown_s": RULE_COOLDOWN_S},
         # per-gun normalisation recipe (None = global z-score only); main.py reproduces it online
         "gun_norm": gn,
         "dropped_features": list(args.drop_features),
