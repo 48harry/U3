@@ -281,8 +281,23 @@ def test_4_api_matches_offline(workspace):
         assert r.json()["severity_source"] in ("rule", "model+rule") and r.json()["critical_in_request"] is True
         assert pd.Timestamp(r.json()["rule_trigger_time"]) == pd.Timestamp(raw["time"].iloc[-300]).tz_localize(None)
         assert r.json()["rule_code"] == "E029" and r.json()["rule_class_hint"] == "E04"
+        # ML -> RAG handoff rides on the rule trigger and lands in the outbox (pull; no RSW_RAG_URL in tests)
+        ho = r.json()["handoff"]
+        assert ho is not None and ho["schema_version"] == "1.0" and ho["gun_id"] == "G2"
+        assert ho["fault_class"]["code"] == "E04" and ho["fault_class"]["basis"] == "rule_trigger"
+        assert ho["trigger"]["source"] in ("rule", "model+rule") and ho["trigger"]["rule_code"] == "E029"
+        assert ho["situation_ids"][0] == "S04" and "E04" in ho["summary_ko"]
+        assert "hypotheses" not in ho and "search" not in ho, "causes / manuals are the ontology's job"
+        recs = client.get("/handoffs", params={"gun_id": "G2"}).json()
+        assert recs[-1]["handoff"]["event_id"] == ho["event_id"] and recs[-1]["delivery"] == "pull_only"
+        assert client.get(f"/handoffs/{ho['event_id']}").status_code == 200
+        assert client.get("/handoffs/nope").status_code == 404
+        prev = client.post("/handoffs/preview", json={k: v for k, v in r.json().items() if k != "handoff"})
+        assert prev.status_code == 200 and prev.json()["fault_class"]["code"] == "E04"
+        assert prev.json()["situation_ids"] == ho["situation_ids"]
         assert r.json()["windows_scored"] == 13, "a window every 60 s back from the latest row: ceil(750 / 60)"
         assert res["rule_triggered"] is False and res["severity_source"] in ("none", "model")
+        assert res["handoff"] is None or res["critical_in_request"], "handoffs only on critical events"
 
         # a window inside the cap-dressing block: alarms are held, never counted, severity stays normal
         r = client.post("/predict", json={"gun_id": "G3", "readings": raw.iloc[1400:1700].to_dict("records")})
@@ -376,6 +391,7 @@ def test_5_api_chunks_sustain_rule(workspace):
         assert s["requests"] == 24 and s["rule_triggers"] == 1
         rule_events = [e for e in s["critical_events"] if e["rule_trigger_time"]]
         assert len(rule_events) == 1 and rule_events[0]["class_hint"] == "E04" and "rule" in rule_events[0]["severity_source"]
+        assert all(e["handoff_event_id"] for e in s["critical_events"]), "every critical event carries a handoff"
         assert s["windows_scored"] >= 100 and s["last"]["gun_norm"] == "gun"
         with pytest.raises(ValueError):
             replay_file(client, str(workspace["test"] / "test_0.csv"), "RP", chunk_s=1201)
