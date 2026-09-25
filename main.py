@@ -14,6 +14,14 @@ Endpoints
     POST /predict                 append readings for one gun, score the latest window
     GET  /guns                    buffer / alarm state of every gun seen so far
     DELETE /guns/{gun_id}         forget a gun's buffer (e.g. after maintenance)
+    GET  /handoffs                RAG handoff documents of critical events (pull; newest last)
+    GET  /handoffs/{event_id}     one handoff document + its delivery status
+    POST /handoffs/preview        AnomalyResult JSON -> handoff document (no state; for the RAG side's tests)
+
+ML -> RAG handoff (.py/rag_mapping.py, schema v1.0): the first request of every critical episode (and every
+terminal-code rule trigger) carries `handoff` - sensor findings in words, fault class, symptoms and the situation
+ids (S01..S10) the ontology looks up. Causes, checks and manual sections are the ontology's job. Every handoff
+is kept in an in-memory outbox (GET /handoffs); with RSW_RAG_URL set it is also POSTed there in the background.
 
 A gun needs `window_s` seconds of readings before the first score (HTTP 202 "warming_up"
 until then); the 10-minute rolling features are exact once 600 s of history exist.
@@ -38,7 +46,7 @@ from typing import Any, Literal
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -46,6 +54,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(PROJECT_ROOT, ".py"))  # train.py / preprocess.py live there
 import train as trainlib  # noqa: E402  (also makes PCADetector importable for pca bundles)
 from preprocess import BINARY_COL, ROLL, SENSOR_COLS, TERMINAL_TO_CLASS, VALUE_COLS, fill_gaps  # noqa: E402
+import rag_mapping  # noqa: E402  (ML -> RAG handoff; pure Python, shared with the RAG side)
 
 MODEL_PATH = os.environ.get("RSW_MODEL_PATH", os.path.join(PROJECT_ROOT, "models", "baseline_iforest.joblib"))
 ROLL_S = int(pd.Timedelta(ROLL).total_seconds())  # 10-minute rolling features, as in preprocess.py
@@ -56,6 +65,10 @@ BUFFER_S = 1800  # per-gun history kept in memory (>= ROLL_S + window + gap limi
 # features of its first row need that history, and rows beyond the buffer would be dropped silently
 MAX_CHUNK = BUFFER_S - ROLL_S
 TOP_K_FEATURES = 8
+# push target for handoffs (e.g. http://127.0.0.1:8001/diagnose); unset = pull only (GET /handoffs)
+RAG_URL = os.environ.get("RSW_RAG_URL")
+RAG_TIMEOUT_S = float(os.environ.get("RSW_RAG_TIMEOUT_S", "10"))
+OUTBOX_MAX = 1000  # handoffs kept in memory for GET /handoffs
 CODE_TO_CLASS = TERMINAL_TO_CLASS  # E012 -> E01 ...
 FaultClass = Literal["E01", "E02", "E03", "E04"]
 SENSOR_NAME = {
@@ -174,6 +187,96 @@ class ModelInfo(BaseModel):
     rule_cooldown_s: int = Field(description="after a terminal-code rule trigger the rule stays quiet this long per gun")
 
 
+# ------------------------------------------------------------ ML -> RAG handoff (rag_mapping.build_handoff)
+# scope: (1) what is unusual + (2) symptom translation with situation ids S01..S10. Causes, check procedures and
+# manual sections belong to the ontology / RAG stage and are NOT in this document.
+class SensorFinding(BaseModel):
+    sensor: str
+    sensor_name: str
+    sensor_name_ko: str
+    group: str = Field(description="compensation | force | position | friction | electrode | io | setpoint | activity")
+    statistic: Literal["mean", "std"]
+    direction: Literal["high", "low", "unstable"] = Field(description="vs this gun's normal; unstable = window std up")
+    deviation_z: float = Field(description="value - reference in the model's z-scored, gun-centred space")
+    share: float = Field(ge=0, le=1, description="share of the anomaly score this feature explains")
+    text_ko: str = Field(description="e.g. '보정(밸런스) 압력(c5) 평소보다 낮음'")
+
+
+class Symptom(BaseModel):
+    id: str = Field(description="symptom rule id P1..P8; P9 = rule fired with no sensor signal")
+    name_ko: str
+    match: Literal["full", "partial", "no_sensor_signal"]
+    evidence: list[str]
+    related_classes: list[FaultClass]
+    situation_ids: list[str] = Field(description="keys of the MVP situation definition doc (S01..S10)")
+    agrees_with_fault_class: bool
+    confidence: Literal["low", "medium"] = Field(
+        description="medium only when the terminal-code rule fired and agrees; never high (v1.0)")
+
+
+class FaultClassInfo(BaseModel):
+    code: FaultClass
+    name_en: str
+    name_ko: str
+    terminal_code: str
+    situation_id: str
+    definition: str
+    basis: Literal["rule_trigger", "latest_error_code"]
+
+
+class HandoffTrigger(BaseModel):
+    source: Literal["model", "rule", "model+rule", "none"]
+    rule_code: str | None
+    rule_trigger_time: str | None
+    anomaly_score: float | None
+    threshold: float | None
+    score_z: float | None
+    alarm_duration_s: int
+    sustained: bool
+
+
+class HandoffContext(BaseModel):
+    latest_error_code: str | None
+    error_active_share: float | None
+    non_welding_share: float | None
+    welds_in_window: float | None
+    welds_10min: float | None
+    alarm_held: bool
+    gun_norm: str | None
+
+
+class HandoffDetector(BaseModel):
+    name: str | None
+    created: str | None
+    window_s: int | None
+
+
+class RagHandoff(BaseModel):
+    """What the ontology / RAG stage receives for one critical event (schema_version 1.0)."""
+    schema_version: str
+    event_id: str
+    gun_id: str
+    detected_at: str
+    window_start: str
+    trigger: HandoffTrigger
+    summary_ko: str = Field(description="one line, e.g. '보정 압력 평소보다 낮음; 고장 유형 E01 ...로 보임'")
+    sensor_findings: list[SensorFinding]
+    fault_class: FaultClassInfo | None
+    symptoms: list[Symptom] = Field(description="rule-agreeing first, then full sensor match; may be empty")
+    situation_ids: list[str] = Field(description="situation ids to look up in the ontology, most likely first")
+    context: HandoffContext
+    detector: HandoffDetector
+    caveats: list[str]
+
+
+class HandoffRecord(BaseModel):
+    handoff: RagHandoff
+    created_at: datetime
+    delivery: Literal["pull_only", "pending", "delivered", "failed"]
+    delivery_detail: str | None = None
+    rag_response: dict[str, Any] | None = Field(None, description="body the RAG endpoint returned on push")
+
+
 class AnomalyResult(BaseModel):
     """Document handed to the ontology / root-cause stage."""
     model_config = ConfigDict(json_schema_extra={"example": {
@@ -231,6 +334,9 @@ class AnomalyResult(BaseModel):
     contributing_features: list[FeatureContribution] = Field(description="top features by contribution, descending")
     context: WindowContext
     model: ModelInfo
+    handoff: RagHandoff | None = Field(
+        None, description="set on the first request of a critical episode and on every rule trigger: "
+                          "the RAG handoff document (also in GET /handoffs)")
 
 
 class WarmingUp(BaseModel):
@@ -491,6 +597,8 @@ class GunState:
         self.warmup_rows = 0
         self.norm: dict[str, Any] | None = None
         self.gun_threshold: float | None = None
+        # RAG handoff: one per critical episode (critical_in_request False -> True) + one per rule trigger
+        self.was_critical = False
 
     def frame(self) -> pd.DataFrame:
         return pd.DataFrame(list(self.rows))
@@ -502,6 +610,8 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(f"model not found: {MODEL_PATH} — run .py/train.py or set RSW_MODEL_PATH")
     app.state.detector = Detector(MODEL_PATH)
     app.state.guns: dict[str, GunState] = {}
+    app.state.outbox: deque[HandoffRecord] = deque(maxlen=OUTBOX_MAX)
+    app.state.rag_url = RAG_URL
     log.info("loaded %s (window %ss, threshold %.4f)", MODEL_PATH, app.state.detector.window, app.state.detector.threshold)
     yield
 
@@ -535,7 +645,7 @@ async def model_card(request: Request) -> dict[str, Any]:
 
 @app.post("/predict", response_model=AnomalyResult | WarmingUp,
           responses={202: {"model": WarmingUp, "description": "not enough history yet"}})
-async def predict(req: PredictRequest, request: Request) -> AnomalyResult | JSONResponse:
+async def predict(req: PredictRequest, request: Request, background: BackgroundTasks) -> AnomalyResult | JSONResponse:
     d: Detector = request.app.state.detector
     guns: dict[str, GunState] = request.app.state.guns
     g = guns.setdefault(req.gun_id, GunState(gun_norm=d.gun_norm is not None))
@@ -593,7 +703,7 @@ async def predict(req: PredictRequest, request: Request) -> AnomalyResult | JSON
                                               + d.scaler.get("welds_10min", {}).get("mean", 0.0)),
                             weld_duty_10min=float(w["weld_duty_10min"].iloc[-1]),
                             known_code_class_hint=CODE_TO_CLASS.get(latest_code))
-        return AnomalyResult(
+        result = AnomalyResult(
             gun_id=req.gun_id, window_start=w.index[0].to_pydatetime(), window_end=w.index[-1].to_pydatetime(),
             n_samples=int(len(w)), history_s=int(len(f)), is_anomaly=is_anomaly, anomaly_score=score,
             alarm_held=bool(held),
@@ -608,6 +718,58 @@ async def predict(req: PredictRequest, request: Request) -> AnomalyResult | JSON
             windows_scored=len(ends), sustained_in_request=sustained_in_request,
             critical_in_request=sustained_in_request or rule_hit,
             contributing_features=feats, context=ctx, model=d.info)
+        # ML -> RAG handoff: once per critical episode, and on every rule trigger (same events replay.py prints)
+        critical = result.critical_in_request
+        if (critical and not g.was_critical) or rule_hit:
+            result.handoff = RagHandoff(**rag_mapping.build_handoff(result.model_dump(mode="json")))
+            rec = HandoffRecord(handoff=result.handoff, created_at=datetime.now(timezone.utc),
+                                delivery="pending" if request.app.state.rag_url else "pull_only")
+            request.app.state.outbox.append(rec)
+            if request.app.state.rag_url:
+                background.add_task(push_handoff, rec, request.app.state.rag_url)
+        g.was_critical = critical
+        return result
+
+
+async def push_handoff(rec: HandoffRecord, url: str) -> None:
+    """POST one handoff to the RAG endpoint; the outcome is recorded on the outbox record (never raises)."""
+    import httpx  # only needed when pushing
+
+    try:
+        async with httpx.AsyncClient(timeout=RAG_TIMEOUT_S) as client:
+            r = await client.post(url, json=rec.handoff.model_dump(mode="json"))
+        ok = 200 <= r.status_code < 300
+        rec.delivery = "delivered" if ok else "failed"
+        rec.delivery_detail = f"HTTP {r.status_code}"
+        if ok and r.headers.get("content-type", "").startswith("application/json"):
+            rec.rag_response = r.json()
+    except Exception as e:  # network errors must not break scoring; the record stays pullable
+        rec.delivery, rec.delivery_detail = "failed", f"{type(e).__name__}: {e}"
+        log.warning("RAG push failed for %s: %s", rec.handoff.event_id, e)
+
+
+@app.get("/handoffs", response_model=list[HandoffRecord])
+async def handoffs(request: Request, gun_id: str | None = None,
+                   delivery: Literal["pull_only", "pending", "delivered", "failed"] | None = None,
+                   limit: int = Query(50, ge=1, le=OUTBOX_MAX)) -> list[HandoffRecord]:
+    """Handoff documents of critical events (in-memory, newest last, lost on restart)."""
+    recs = [r for r in request.app.state.outbox
+            if (gun_id is None or r.handoff.gun_id == gun_id) and (delivery is None or r.delivery == delivery)]
+    return recs[-limit:]
+
+
+@app.get("/handoffs/{event_id}", response_model=HandoffRecord)
+async def handoff(event_id: str, request: Request) -> HandoffRecord:
+    for r in request.app.state.outbox:
+        if r.handoff.event_id == event_id:
+            return r
+    raise HTTPException(status_code=404, detail=f"unknown event {event_id}")
+
+
+@app.post("/handoffs/preview", response_model=RagHandoff)
+async def handoff_preview(result: AnomalyResult) -> RagHandoff:
+    """Map any AnomalyResult (e.g. the /predict schema example) to its handoff without touching server state."""
+    return RagHandoff(**rag_mapping.build_handoff(result.model_dump(mode="json")))
 
 
 @app.get("/guns", response_model=list[GunStatus])

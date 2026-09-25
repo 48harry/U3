@@ -73,6 +73,8 @@
 - 비용접 행은 **건별로 들고 있는 마지막 용접 값**(`GunState.carry`)을 carry한다. 버퍼 안에서만 ffill하면 30분보다 긴 캡 드레싱/대기 구간에서 버퍼 전체가 NaN → HTTP 500(실데이터 test_0 재생에서 발견, 2026-09-24). 한 번도 용접 행을 못 본 스트림은 202.
 - 온라인 전처리가 오프라인과 같은 점수를 내는지는 `tests/test_pipeline.py`(합성)와 실데이터(test_3 마지막 30분, 점수 일치)로 확인했다. 요청당 ~40 ms.
 
+- **ML → RAG 핸드오프(2026-09-25, `.py/rag_mapping.py`, readme 5.10)**: 역할 분담 결정 — ML은 ① 이상 감지와 ② 증상 번역(기여 피처 → 방향 → 증상 P1~P9 → 고장 유형 → **상황 ID S01~S10**)까지만 하고, 원인·점검·매뉴얼(③)은 온톨로지(지현), 리포트(④)는 RAG가 맡는다. 핸드오프에 부품·점검·매뉴얼을 넣지 않는다(테스트로 고정). 상황 ID는 팀 문서 「RSW 용접건 MVP 오류 상황 정의서」의 키. 트리거는 critical 에피소드 첫 요청 + 규칙 발화마다(`GunState.was_critical`, `replay.py`와 같은 규칙). `/predict` 응답에 `handoff` 필드 **추가**(평소 null), 메모리 outbox → `GET /handoffs`(pull), `RSW_RAG_URL`이면 백그라운드 POST(push, 재시도 없음), `POST /handoffs/preview`. 스키마 `RagHandoff` v1.0. 신뢰도 low/medium뿐. 실데이터 재생(테스트 8건 마지막 12h): 9 이벤트 중 8건이 고장 직전 올바른 상황을 맨 앞에, 센서 증상이 매뉴얼 패턴과 맞은 건 1건 — 믿을 키는 `situation_ids[0]`(고장 유형 유래).
+
 ## 6. 코드 규약
 
 - 스크립트는 `.py/`, API는 루트 `main.py`(`uvicorn main:app`). `main.py`는 `sys.path`에 `.py/`를 넣어 `train`, `preprocess`를 import한다 — 번들 언피클에 `train.PCADetector`가 필요하다.
@@ -113,3 +115,4 @@
 - 2026-09-23: 윈도우 집계 컬럼명 결함 수정. `_mean`/`_std` 접미사를 **`feat_cols`에 든 컬럼에만** 붙이도록 조건을 걸었다 — 이전에는 `mean`으로 집계하는 `non_welding`까지 `non_welding_mean`이 되어 `--exclude-non-welding`이 `KeyError`로 죽고 점수 CSV에서 열이 빠졌다. 모델 입력·점수는 불변(재학습 불필요, 전 윈도우 점수 동일함을 실측 확인). `test_2b_window_columns`로 고정.
 - 2026-09-24: 문서 역할 분리. `readme.md`·`test.md`는 최신 결과만(test.md를 현재 46피처 모델 기준으로 재작성, readme의 〔수정〕 경위·5.9 진행 이력·5.11 변경 요약 제거), 경과는 신규 `history.md`로 이동(구 test.md 전문 포함). 이 파일의 `test.md` N절 참조를 `history.md`(구 test.md N절)로 변경. §6에 규약 추가.
 - 2026-09-24: **MVP 리뷰 반영**(`history.md` 9절). 종료 코드 규칙을 에피소드 시작 1회 + 30분 쿨다운으로(서빙·평가 동일, 평가는 4개 코드 전부 — 테스트 오트리거 0.25회/일/건 드러남), 지속 알람을 요청 횟수 → 시간 기준(180초), 요청 한도 1,200행(422) + 청크 내 모든 윈도우 스코어링, 비용접 carry를 버퍼 밖까지(실데이터 500 수정), `rule_code`/`rule_class_hint` 등 필드 추가, `.py/replay.py` 추가. 모델 재학습(동일 결과), 지표 갱신. §4·§5·§6·§7 갱신.
+- 2026-09-25: **ML → RAG 핸드오프** 추가(`.py/rag_mapping.py`, `.py/mock_rag.py`, `main.py` 스키마·`/handoffs`·`handoff` 필드, `replay.py` 이벤트에 상황 ID·요약, `tests/test_rag_mapping.py`, `docs/*.example.json`(실데이터), readme 5.10 개발 스펙·테스트, history.md 10절). 범위는 ①②(증상 번역 + 상황 ID)로 한정. §5에 계약 추가. httpx를 본 의존성으로.

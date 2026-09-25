@@ -138,12 +138,12 @@ E01~E04를 정답으로 삼는 분류는 하지 않는다. 정상 대비 이탈 
 
 ### 3. 하류 파이프라인 구상 — 원인 분석과 알림
 
-이상탐지 신호가 나온 다음 단계다. **현재 1~2번까지의 입력 계약(`AnomalyResult`)만 구현되어 있고, 3번 이후는 미구현이다**(5.7절, 5.9절).
+이상탐지 신호가 나온 다음 단계다. **ML 쪽(1~2번과 RAG로 넘기는 핸드오프)은 구현되어 있고, 3~4번(매뉴얼 검색·LLM 리포트)은 RAG 담당이 핸드오프 명세(5.10절)를 받아 구현한다.**
 
 1. 필터링된 강한 이상 시그널이 탐지되면 Root Cause Agent로 전달 → **구현됨**: `severity: critical`(임계 초과가 sustain × window = 180초 이상 지속, 또는 종료 코드 에피소드 시작)이 트리거 기준
-2. Agent가 이상 감지 시점 앞뒤의 센서 수치·로그 스트림을 모아 컨텍스트 구성 → **부분 구현**: `contributing_features`(어떤 센서가 점수를 올렸는지)와 `context`(에러 코드, 용접 활동량)를 API가 이미 내보낸다
-3. 감지된 에러 코드에 맞는 정비 지침서를 Vector DB에서 RAG로 검색 → **미구현**
-4. LLM이 이상 패턴과 검색된 매뉴얼을 융합해 원인·영향도·조치 가이드를 자연어로 요약 → **미구현**
+2. Agent가 이상 감지 시점 앞뒤의 센서 수치·로그 스트림을 모아 컨텍스트 구성 → **구현됨**: critical 이벤트마다 **핸드오프 문서**(센서 증상을 말로 번역, 고장 유형, 상황 ID S01~S10)를 만든다(`.py/rag_mapping.py`, 5.10절)
+3. 감지된 에러 코드에 맞는 정비 지침서를 Vector DB에서 RAG로 검색 → **온톨로지·RAG 담당**(입력은 핸드오프의 `situation_ids`)
+4. LLM이 이상 패턴과 검색된 매뉴얼을 융합해 원인·영향도·조치 가이드를 자연어로 요약 → **RAG 담당**(응답 형식은 5.10.6절)
 
 이후 계획:
 
@@ -614,6 +614,8 @@ g.columns = [f"{a}_{b}" if a in feat_cols and b in ("mean", "std") else a for a,
 | GET | `/model` | 모델 카드: 윈도우·임계값·피처(`dropped_features` 포함)·전처리 파라미터·건별 정규화 레시피·검증/테스트 지표·파일 목록 |
 | GET | `/health`, `/guns` | 상태 / 건별 버퍼·연속 알람·워밍업 상태(`gun_norm`, `gun_threshold`, `warmup_rows`) |
 | DELETE | `/guns/{gun_id}` | 버퍼 리셋(정비 후) |
+| GET | `/handoffs`, `/handoffs/{event_id}` | critical 이벤트의 RAG 핸드오프 문서와 전달 상태(5.10절) |
+| POST | `/handoffs/preview` | `AnomalyResult` JSON → 핸드오프 문서(서버 상태 무관, RAG 쪽 테스트용) |
 
 입력 `SensorReading` = CSV 컬럼 그대로(`time, c1~c19, error`; `c10`은 on/off·bool 허용, `error`는 `^(0|E\d{3})$`).
 
@@ -661,6 +663,7 @@ python .py/replay.py test/test_0.csv --speed 60               # 60배속
 
 #### 5.8 품질 관리
 
+- `tests/test_rag_mapping.py`: 핸드오프 매핑 단위 테스트(순수 Python, 1초 미만) — 센서 방향 판정, 규칙·증상 일치 시 신뢰도, 정지 조건, 설정값 변경, 상황 ID 유효성, 원인·매뉴얼 미포함, `main.RagHandoff`와 키 일치.
 - `pytest` → `tests/test_pipeline.py`: 합성 CSV(클래스별 2파일 + 테스트 2파일, 2시간, gap·캡 드레싱·종료 코드 포함)를 임시 폴더에서 2→3→4→4'→`--score`→5단계(`/predict`)까지 돌리고, API 점수가 오프라인 점수와 같은지 확인한다. 학습은 `--warmup-hours 0.5`로 돌려 2시간 파일에서도 건별 워밍업이 끝나게 하고, API가 워밍업 전(`warming_up`, 글로벌 임계값)과 후(`gun`, 건별 임계값·재정규화 점수가 오프라인 `window_file`/`gun_thresholds`와 일치)를 모두 재현하는지 본다. 실데이터 폴더는 건드리지 않는다. 파이프라인 코드를 고치면 이것부터 돌린다.
 - 검증 항목: 번들의 `gun_norm`·`dropped_features`(c19 제외, 46피처)·`alarm_max_non_welding`·`rule`, 점수 CSV의 `threshold`/`warmup` 열, API의 `alarm_held`(캡 드레싱 구간), `rule_triggered`(에피소드 시작 1회, 쿨다운), `gun_norm` 전·후 점수 일치, 요청 크기 한도(422), 시간 기준 지속 알람(10초 청크로 보내도 180초에 critical), 버퍼보다 긴 비용접 구간, `replay.py`로 2시간 파일 재생.
 - 회귀 고정: `test_2b_window_columns`는 윈도우 집계가 연속 피처(24개, 모델 입력은 그중 23개)에만 `_mean`/`_std`를 붙이고 메타데이터 이름은 그대로 두는지 확인한다. 합성 데이터의 캡 드레싱 구간을 **분 경계에서 30초 어긋나게** 만들어, `non_welding`이 `max`(=1)가 아니라 `mean`(=0.5)으로 집계되는지도 함께 검증한다.
@@ -678,5 +681,100 @@ python .py/replay.py test/test_0.csv --speed 60               # 60배속
 5. `c16 = 8.7`(두꺼운 판) 구간은 z-score 입력으로 들어간다. 판 두께가 다른 새 건에서는 오프셋으로 나타날 수 있다(건별 centering이 일부 흡수).
 6. 서빙 윈도우는 트레일링 60초, 학습 윈도우는 분 경계 정렬 — 정확히 맞추려면 서빙도 분 경계로 자른다.
 7. `Benchmark_fixed.py`의 실제 학습 경로는 미검증.
-8. 3절의 하류(온톨로지/RAG 원인 분석, LLM 리포트, Slack)는 미구현. 입력 계약은 5.7의 `AnomalyResult`, 트리거는 `critical_in_request`. 스트림 입력은 `replay.py`로 재현할 수 있다.
+8. ML → RAG 핸드오프(①② 이상 감지·증상 번역, 상황 ID)는 구현(5.10절). 원인·점검·매뉴얼(온톨로지), LLM 리포트, Slack은 다른 담당이며 미구현이다. 센서 증상 규칙은 매뉴얼 기반이고 실데이터에서 거의 맞지 않았다(5.10.5).
 9. 건별 상태(워밍업·버퍼·쿨다운)는 서버 메모리에만 있다 — 재시작하면 6시간 워밍업부터 다시 한다.
+
+#### 5.10 ML → RAG 핸드오프 (개발 스펙 v1.0)
+
+ML(이상탐지)과 온톨로지·RAG(원인·점검·매뉴얼·리포트)를 **따로 개발하기 위한 인터페이스 명세**다. 코드: `.py/rag_mapping.py`(매핑, 순수 Python), `main.py`(스키마 `RagHandoff`·엔드포인트), `.py/mock_rag.py`(가짜 RAG). 예시(실데이터 test_3 이벤트): `docs/anomaly_result.example.json` → `docs/rag_handoff.example.json` → `docs/rag_response.example.json`. 상황 ID의 정의는 팀 문서 「RSW 용접건 MVP 오류 상황 정의서」(S01~S10).
+
+##### 5.10.1 역할 분담
+
+| 단계 | 담당 | 예 |
+|---|---|---|
+| ① 이상 감지 | ML | "critical, 점수 0.61, c5 기여 41%, 에러 코드 E012" (`AnomalyResult`) |
+| ② 증상 번역 | **ML (이 절)** | "보정 압력(c5) 평소보다 낮음; 고장 유형 E01(보정 압력 도달 지연) 의심" + 상황 ID `S01` |
+| ③ 원인·점검·매뉴얼 | 온톨로지 | 상황 ID로 조회: 의심 부품, 점검 순서, 매뉴얼 섹션 |
+| ④ 리포트 | RAG + LLM | 7단계 리포트(5.10.6) |
+
+핸드오프에는 부품 이름·점검 절차·매뉴얼 쪽수가 **없다**(`test_no_causes_or_manuals_in_handoff`가 고정). 두 쪽을 잇는 키는 `situation_ids`다.
+
+##### 5.10.2 언제 넘기나 (트리거)
+
+- critical 에피소드의 **첫 요청**(직전 요청은 critical 아님 → 이번 `critical_in_request=true`)에 1회.
+- 종료 코드 규칙이 발화할 때마다(`rule_triggered=true`; 에피소드 시작 1회 + 건별 30분 쿨다운).
+- `replay.py`도 같은 이벤트를 찍는다(`situations=[...] | 요약`).
+
+##### 5.10.3 어떻게 넘기나 (전달 방식)
+
+| 방식 | 설정 | 동작 |
+|---|---|---|
+| 동기 응답 | 항상 | `/predict` 응답의 `handoff` 필드(평소 `null`) |
+| pull | 없음 | 서버 메모리 outbox(최근 1,000건): `GET /handoffs?gun_id=&delivery=&limit=`, `GET /handoffs/{event_id}`. 재시작하면 사라진다 |
+| push | `RSW_RAG_URL=http://host:port/diagnose` | 이벤트마다 백그라운드 POST(`RSW_RAG_TIMEOUT_S`, 기본 10초). 결과는 레코드의 `delivery`(`pending`/`delivered`/`failed`)·`delivery_detail`·`rag_response`. 실패해도 스코어링은 계속되고 pull로 다시 가져갈 수 있다. 재시도 없음 |
+| 미리보기 | 없음 | `POST /handoffs/preview`: `AnomalyResult` JSON → 핸드오프(서버 상태 무관, RAG 쪽 개발용) |
+
+##### 5.10.4 무엇을 넘기나 (스키마 `RagHandoff` v1.0)
+
+JSON Schema는 서버의 `/docs`·`/openapi.json`.
+
+| 필드 | 내용 |
+|---|---|
+| `schema_version`, `event_id`, `gun_id`, `detected_at`, `window_start` | 식별. `event_id`는 UUID hex, 시각은 naive UTC ISO |
+| `trigger` | `source`(model / rule / model+rule), `rule_code`, `rule_trigger_time`, `anomaly_score`, `threshold`, `score_z`, `alarm_duration_s`, `sustained` |
+| `summary_ko` | 한 줄 요약. 예: "보정(밸런스) 압력(c5) 평소보다 낮음; 고장 유형 E01(보정 압력 도달 지연) 의심, 에러 코드 E012." |
+| `sensor_findings[]` | 점수의 5% 이상을 설명하고 정상 기준에서 z 1.0 이상 벗어난 피처(최대 6개, 시각 피처 제외): `sensor`, `sensor_name(_ko)`, `group`, `statistic`, `direction`(high / low / unstable), `deviation_z`, `share`, `text_ko` |
+| `fault_class` | 종료 코드 기준 고장 유형: `code`(E01~E04), `name_en`, `name_ko`, `terminal_code`, `situation_id`(S01~S04), `definition`, `basis`(rule_trigger / latest_error_code). 없으면 `null` |
+| `symptoms[]` | 센서 증상 규칙(5.10.5) 매칭: `id`(P1~P9), `name_ko`, `match`, `evidence`, `related_classes`, `situation_ids`, `agrees_with_fault_class`, `confidence`(low / medium) |
+| `situation_ids` | 온톨로지에서 조회할 상황 ID, 가능성 높은 순(고장 유형의 상황이 항상 먼저) |
+| `context`, `detector`, `caveats` | 윈도우 상황, 모델 정보, 해석 한계 문구 |
+
+호환 규칙: 필드 추가는 1.x, 삭제·의미 변경은 2.0. `rag_mapping.build_handoff()`와 `main.RagHandoff`의 키는 `tests/test_rag_mapping.py::test_schema_keys_match_main`이 묶는다.
+
+##### 5.10.5 증상 규칙 (센서 → 증상 → 상황 ID)
+
+근거: `RSW용접건_매뉴얼_RAG_활용정리` §8(매뉴얼 지식). 방향은 이 gun의 워밍업 평균 대비 z-score다.
+
+| 증상 | 조건 (핵심 → 보조) | 관련 고장 | 상황 ID |
+|---|---|---|---|
+| P1 보정 압력 저하 + 힘 형성 지연 | c5 low → c4 high | E01 | S01 |
+| P2 전극 힘 저하 + 보정 압력 저하 | c2 low → c5 low | E01 | S05 |
+| P3 마찰 증가 + 전극 힘 저하 | c6 high → c2 low | E03 | S06 |
+| P4 정지 중 전극 위치 흔들림 | c3 unstable + 윈도우 내 용접 0 | E04 | S04 |
+| P5 동작 중 위치·열림 폭 이탈 | c3 high (또는 c3 low, c7 high/low) | E03, E02 | S08, S03 |
+| P6 캡 오프셋 변화 | c1 high/low → c6 high | E02 | S07 |
+| P7 설정값 변화 | c13~c18 중 하나 | — | S10 |
+| P8 에러 상태 비율 증가 | error_share_10min high | — | S10 |
+| P9 건 센서 정상 | 규칙 발화 + 증상 피처 없음 | — | 고장 유형이 없을 때만 S09 |
+
+- **신뢰도**: 종료 코드 규칙이 발화했고 증상의 관련 고장과 같을 때만 `medium`, 나머지 `low`. `high`는 없다.
+- **실데이터 확인(2026-09-25, 테스트 8건 마지막 12시간 재생, 10분 청크)**: 이벤트 9건 — 8건이 고장 직전 종료 코드로 올바른 상황(S01~S04)을 맨 앞에 냈고, 1건은 test_0(E01)의 고장 7시간 전 E029 오트리거(S04). 센서 증상이 매뉴얼 패턴(P1~P6)과 맞은 것은 1건(test_3 P5)뿐이고, 나머지는 설정값·US2·증상 없음이었다. **실제로 믿을 만한 키는 고장 유형에서 온 `situation_ids[0]`이다.** 데이터 점검은 `history.md` 10절.
+- 시각(`hour_sin/cos`)은 증상으로 보고하지 않는다. c10(US2)은 이진 신호라 low를 "꺼짐(평소 켜짐)"으로 쓴다.
+
+##### 5.10.6 RAG가 돌려줄 것 (응답 계약, push 방식)
+
+RAG 서비스는 `POST /diagnose`(핸드오프 JSON)를 받아 아래 형태로 답한다. `report`의 7개 키는 활용정리 문서 §9의 답변 형식이다. 가짜 RAG는 ③이 필요한 칸을 `[mock]`으로 비워 둔다.
+
+```json
+{"event_id": "...", "status": "ok", "generator": "mock | rag-v1",
+ "report": {"detected_anomaly": "...", "suspected_device": "...", "cause_candidates": [{"situation_id": "S01", "name": "..."}],
+            "manual_references": [{"manual": "...", "sections": ["..."]}], "additional_checks": ["..."],
+            "recommended_actions": ["..."], "confidence_and_limits": ["..."]}}
+```
+
+##### 5.10.7 테스트
+
+| 단계 | 명령 | 통과 기준 |
+|---|---|---|
+| 1 매핑 단위 | `pytest tests/test_rag_mapping.py -v` | 11 passed, 1초 미만 |
+| 2 전체 | `pytest` | 모두 passed(합성 데이터로 학습→API→핸드오프까지, 약 30초~1분) |
+| 3 미리보기 | `uvicorn main:app` → 브라우저 `http://127.0.0.1:8000/docs` → `POST /handoffs/preview`에 `docs/anomaly_result.example.json` 붙여넣기 | 200, `situation_ids` 첫 값 `S02` |
+| 4 실데이터 재생 | `python .py/replay.py test/test_1.csv --start-hours 156 --chunk-s 600` | 이벤트 1건, `situations=['S01']` |
+| 5 push | 가짜 RAG(`uvicorn mock_rag:app --app-dir .py --port 8001`) + `RSW_RAG_URL` 설정 후 4 | `GET :8000/handoffs`의 `delivery`가 `delivered`, `GET :8001/received`에 같은 `event_id` |
+
+##### 5.10.8 미결
+
+1. 지현님 온톨로지의 입력 형식·주소가 정해지면 `RSW_RAG_URL`로 연결하고 필드 이름을 맞춘다(금요일 목표).
+2. outbox는 메모리뿐이다(재시작 시 소실). 운영하려면 파일·DB 저장과 push 재시도가 필요하다.
+3. `MIN_SHARE`(0.05)·`MIN_DEV`(1.0)는 임의값이다.
+4. 센서 증상은 모델 성능이 오르기 전까지 보조 정보다(5.9절 1).
