@@ -65,7 +65,7 @@ def replay_file(client: Any, path: str, gun_id: str | None = None, chunk_s: int 
     if reset:
         client.delete(f"/guns/{gun_id}")  # 404 for an unknown gun is fine
     summary: dict[str, Any] = {"gun_id": gun_id, "file": os.path.basename(path), "rows": len(df), "requests": 0,
-                               "warming_up": 0, "windows_scored": 0, "critical_events": [], "rule_triggers": 0,
+                               "warming_up": 0, "windows_scored": 0, "critical_events": [], "rule_triggers": 0, "rule_repeats": 0,
                                "max_score": None, "last": None}
     was_critical = False
     for part in chunks(df, chunk_s):
@@ -79,17 +79,19 @@ def replay_file(client: Any, path: str, gun_id: str | None = None, chunk_s: int 
         res = r.json()
         summary["windows_scored"] += res["windows_scored"]
         summary["rule_triggers"] += int(res["rule_triggered"])
+        rule_critical = res["rule_triggered"] and not res.get("rule_repeat", False)
+        summary["rule_repeats"] += int(res["rule_triggered"] and not rule_critical)
         summary["max_score"] = max(summary["max_score"] or res["anomaly_score"], res["anomaly_score"])
         summary["last"] = res
         critical, event = res["critical_in_request"], None
         # one event per critical episode (a sustained alarm stays critical over many requests); a rule trigger
-        # is always its own event
-        if (critical and not was_critical) or res["rule_triggered"]:
+        # is always its own event, unless it is a repeat (not critical)
+        if (critical and not was_critical) or rule_critical:
             event = {
                 "window_end": res["window_end"],
                 # source of the request's criticality (severity_source describes the latest window only)
                 "severity_source": "+".join(k for k, v in (("model", res["sustained_in_request"]),
-                                                           ("rule", res["rule_triggered"])) if v),
+                                                           ("rule", rule_critical)) if v),
                 "rule_trigger_time": res["rule_trigger_time"],
                 # the code that fired the rule (it has often cleared by window_end), else the latest one
                 "error_code": res["rule_code"] or res["context"]["latest_error_code"],
@@ -163,7 +165,7 @@ def main() -> None:
                     sink.close()
             last = s["last"] or {}
             print(f"{gun}: {s['rows']:,} rows, {s['requests']:,} requests, {s['windows_scored']:,} windows, "
-                  f"{len(s['critical_events'])} critical events ({s['rule_triggers']} rule triggers), "
+                  f"{len(s['critical_events'])} critical events ({s['rule_triggers']} rule triggers, {s['rule_repeats']} repeats), "
                   f"max score {s['max_score'] or float('nan'):.3f}, final gun_norm {last.get('gun_norm')}, "
                   f"{time.time() - t0:.0f}s", flush=True)
 

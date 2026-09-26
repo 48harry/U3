@@ -5,18 +5,20 @@
 - When a decision changes, update the matching section in `MEMORY.md` and add a line to its 변경 이력. Don't duplicate what the code or `readme.md` already states.
 
 ## Build & Test Commands
-- **Run Server**: `uvicorn main:app --reload`
-- **Run Tests**: `pytest`
-- **Run Single Test**: `pytest tests/test_user.py -k test_login`
-- **Lint & Format**: `black . && ruff check .`
-- **Docker**: `docker-compose up --build`
+- **Preprocess**: `python .py/preprocess.py` (train, ~7 min) → `python .py/preprocess.py --split test`
+- **Train + evaluate**: `python .py/train.py --exclude-non-welding --cv 4` (~1 min) → `python .py/train.py --evaluate`
+- **Experiments**: `python .py/experiments.py cache --window 60` → `python .py/experiments.py run <name>` (results in `results/`)
+- **Run Server**: `uvicorn main:app --reload` (stream replay: `python .py/replay.py`)
+- **Run Tests**: `pytest` (synthetic end-to-end, ~1 min; never touches the real data folders)
+- **Run Single Test**: `pytest tests/test_pipeline.py -k rule`
+- **Lint**: `ruff check .` (config in `pyproject.toml`, line length 120)
 
 ## Code Style & Architecture
-- **Environment**: Python 3.11+ / FastAPI
-- **Architecture**: Controller (Router) -> Service -> Repository (SQLAlchemy ORM)
-- **Type Hints**: Explicit type hints required for all function parameters and return values.
-- **Validation**: Use Pydantic v2 schemas for all request/response models.
-- **Async**: Use `async/await` for database I/O and external API calls.
+- **Environment**: Python 3.11+, Windows, CPU-only. pandas / scikit-learn / FastAPI + Pydantic v2.
+- **Layout**: scripts in `.py/` (`preprocess.py` → `train.py`; `experiments.py` lab; `rag_mapping.py` handoff), API in root `main.py`, which imports `train` / `preprocess` so that training and serving share one implementation. No database.
+- **Type Hints**: Explicit type hints for function parameters and return values in `main.py`; the `.py/` scripts follow their existing style.
+- **Validation**: Pydantic v2 schemas for all API request/response models. `AnomalyResult` / `RagHandoff` are contracts: add fields, never remove or change meaning.
+- **Paths**: from `PROJECT_ROOT` (`__file__`), never the cwd. Outputs go to `models/`, `results/`, `eda_out/`, never into `train/`, `test/`, `preprocessed/`.
 
 ## Token & Output Optimization Rules
 - **Concise Responses**: Skip intros, outros, polite chatter, and conversational filler.

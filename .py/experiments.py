@@ -1,17 +1,22 @@
 """
-P1 / P2 experiment lab (history.md, old test.md §4; 2026-09-23).
+P1 / P2 / P3 experiment lab (history.md, old test.md §4 and §11; 2026-09-23 / 09-26).
 
 Windows the preprocessed files ONCE per window length - with the production per-gun
 normalisation from train.py - into results/p1p2/cache/, then runs the experiments on those
-frames and writes one JSON per experiment to results/p1p2/. Nothing here touches models/.
+frames and writes one JSON per experiment to results/p1p2/ (P3: results/p3/). Nothing here touches models/.
 
-    python .py/experiments.py cache --window 60          # ~3 min, once
+The cache keeps EVERY preprocessed column, c19 included: the plain names below (base60, sup_lgbm60, ...) are
+the 2026-09-23 runs WITH the c19 label leak and are kept only for the record. Honest runs drop it - the
+`noc19_` / `clean_` prefixes and every P3 experiment do.
+
+    python .py/experiments.py cache --window 60          # ~3 min, once (rebuild after train.window_features changes)
     python .py/experiments.py cache --window 300
+    python .py/experiments.py cache-maint                # P3 maintenance-history features, ~5 min
     python .py/experiments.py run all                    # or a list of experiment names
     python .py/experiments.py summary                    # markdown table of every result JSON
 
-Experiments (the names are the JSON file names):
-    base60            IsolationForest on the 48 window features            (= the production model)
+Experiments (the names are the JSON file names; "48 features" = 46 honest + c19_mean/_std):
+    base60            IsolationForest on the 48 window features            (the 2026-09-23 production model)
     hist_std60        + rolling-history features of the 24 `_std` features  (P1 variability / trend)
     hist_all60        + rolling-history features of all 48 features
     base300           5-minute windows                                       (P1 `--window 300`)
@@ -26,6 +31,10 @@ Experiments (the names are the JSON file names):
     no_e02_60         base60 evaluated without the E02 files
     labelwin_<s>      base60 + LightGBM with the pre-failure window = <s> seconds (P2 label sensitivity)
     cv4_base60        gun-level 4-fold of base60 (P2 evaluation design)
+  P3 (2026-09-26, c19 always dropped, gun-level 4-fold over the 64 train guns + the 8 test guns per fold model,
+  pooled AND per-gun AUROC):
+    p3_labelcv        IsolationForest + LightGBM for pre-failure windows of 900 / 1800 / 2700 / 3600 / 7200 s
+    p3_maint          + maintenance-history features (cap dressing / c1 cap-offset changes), IF + LightGBM
 Every result carries train.evaluate()'s operating-point block and the terminal-code rule baseline.
 """
 import argparse
@@ -44,6 +53,7 @@ import train as T  # noqa: E402
 ROOT = T.PROJECT_ROOT
 DATA = os.path.join(ROOT, "preprocessed")
 OUT = os.path.join(ROOT, "results", "p1p2")
+OUT3 = os.path.join(ROOT, "results", "p3")
 CACHE = os.path.join(OUT, "cache")
 SEED = 42
 Q = 0.99
@@ -185,7 +195,7 @@ def evaluate_split(df, scores, thr, gthr):
     return T.evaluate(df, scores, thr, SUSTAIN, GATE, gthr)
 
 
-def run_unsup(name, D, cols, fit_fn, score_fn, note="", thr_frame=None):
+def run_unsup(name, D, cols, fit_fn, score_fn, note="", thr_frame=None, write=True):
     """Generic unsupervised run: fit on normal training windows, threshold at the Q quantile of the
     training-normal scores (optionally of a sequence-transformed score), per-gun thresholds from
     the calibration windows, train.evaluate() on val and test."""
@@ -201,7 +211,8 @@ def run_unsup(name, D, cols, fit_fn, score_fn, note="", thr_frame=None):
         df = D[key]
         s = score_fn(model, df)
         res[split] = evaluate_split(df, s, thr, gun_thr(model, score_fn, D[ckey], thr, Q))
-    save(res)
+    if write:
+        save(res)
     return res, model
 
 
@@ -315,7 +326,7 @@ class LSTMAE:
         return out
 
 
-def run_supervised(name, D, cols, note=""):
+def run_supervised(name, D, cols, note="", write=True):
     """LightGBM on label (pre-failure 1 h = 1, normal = 0), gun-level split: the AUROC a model can
     reach with these features when it is TOLD the answer. Not a candidate for production."""
     import lightgbm as lgb
@@ -338,7 +349,8 @@ def run_supervised(name, D, cols, note=""):
     for split, key, ckey in (("val", "va", "cva"), ("test", "te", "cte")):
         df = D[key]
         res[split] = evaluate_split(df, score_fn(model, df), thr, gun_thr(model, score_fn, D[ckey], thr, Q))
-    save(res)
+    if write:
+        save(res)
     return res
 
 
@@ -460,6 +472,129 @@ def exp_cv(D, k=4, name="cv4_base60"):
     return res
 
 
+# ------------------------------------------------------------------ P3 (2026-09-26)
+MAINT_CAP_MIN = 360  # lookbacks / "time since" features stop at 6 h: longer ones would grow with the file age (= ttf, c19-style leak)
+MAINT_COLS = ["min_since_dress", "dress_starts_6h", "nw_share_6h", "min_since_c1_change", "c1_changes_6h",
+              "c1_vs_6h", "welds_since_dress"]
+
+
+def maintenance_features(df):
+    """Per-second maintenance history from a preprocessed file: cap dressing = a non-welding block (c16 <= 0),
+    cap offset c1 steps when the cap is dressed / changed. Every feature looks back at most 6 h (capped)."""
+    t = df.index
+    nw = df["non_welding"].to_numpy() > 0
+    start = nw & ~np.r_[False, nw[:-1]]
+    end = ~nw & np.r_[False, nw[:-1]]
+    c1 = df["c1"].to_numpy()
+    step = np.r_[False, np.abs(np.diff(c1)) > 1e-6]
+    welding = df["welds_delta"].to_numpy() > df["welds_delta"].min()  # a weld counted this second (z-scored delta)
+
+    def since(ev):
+        last = pd.Series(np.where(ev, t.asi8, np.nan), index=t).ffill().to_numpy()
+        return np.minimum((t.asi8 - last) / 6e10, MAINT_CAP_MIN)  # ns -> min; never seen = capped (fillna below)
+
+    s = pd.DataFrame({"start": start.astype("float32"), "nw": nw.astype("float32"), "step": step.astype("float32")}, index=t)
+    r = s.rolling("6h", min_periods=1)
+    blk = np.cumsum(end)  # welds since the last dressing block ended
+    wsd = pd.Series(welding.astype("float32"), index=t).groupby(blk).cumsum().to_numpy()
+    out = pd.DataFrame({
+        "min_since_dress": since(end), "dress_starts_6h": r["start"].sum().to_numpy(), "nw_share_6h": r["nw"].mean().to_numpy(),
+        "min_since_c1_change": since(step), "c1_changes_6h": r["step"].sum().to_numpy(),
+        "c1_vs_6h": c1 - pd.Series(c1, index=t).rolling("6h", min_periods=1).mean().to_numpy(),
+        "welds_since_dress": np.minimum(wsd, 5000)}, index=t)
+    return out.fillna(MAINT_CAP_MIN).astype("float32")
+
+
+def build_maint_cache(window=60):
+    """Window-mean of the maintenance features, keyed like the window cache (file, time)."""
+    for split, fs in (("train", sorted(glob.glob(os.path.join(DATA, "E0*.parquet")))),
+                      ("test", T.test_files_in(os.path.join(DATA, "test")))):
+        parts = []
+        for i, f in enumerate(fs, 1):
+            df = pd.read_parquet(f, columns=["file", "segment_id", "non_welding", "c1", "welds_delta"])
+            m = maintenance_features(df)
+            g = m.groupby([df["segment_id"], pd.Grouper(freq=f"{window}s")]).mean().droplevel(0)
+            g["file"] = df["file"].iloc[0]
+            parts.append(g)
+            log(f"[maint {split} {i}/{len(fs)}] {os.path.basename(f)}")
+        x = pd.concat(parts)
+        x.index.name = "time"
+        x.reset_index().to_parquet(os.path.join(CACHE, f"maint{window}_{split}.parquet"))
+
+
+def add_maint(D, window=60):
+    D2 = dict(D)
+    for split, keys in (("train", ("all", "tr", "va", "cal_all", "cva")), ("test", ("te", "cte"))):
+        m = pd.read_parquet(os.path.join(CACHE, f"maint{window}_{split}.parquet"))
+        for k in keys:
+            x = D[k].reset_index().merge(m, on=["file", "time"], how="left").set_index("time")
+            x[MAINT_COLS] = x[MAINT_COLS].fillna(MAINT_CAP_MIN)
+            D2[k] = x
+    return D2
+
+
+def cv_run(name, D, cols, kind, L=None, drop_warmup=False, k=4, note=""):
+    """Gun-level k-fold over the 64 train guns; each fold model also scores the 8 test guns. kind = iforest | lgbm.
+    Reports mean +- sd over folds of pooled AUROC, per-gun AUROC mean, recall, normal alarm rate, and the summed
+    operating point. drop_warmup removes the first 6 h of every gun from fit and evaluation."""
+    stem = lambda p: os.path.splitext(os.path.basename(p))[0]  # noqa: E731
+    folds = T.cv_folds(sorted(glob.glob(os.path.join(DATA, "E0*.parquet"))), k, SEED)
+    base = relabel_all(D, L) if L else D
+    if drop_warmup:
+        base = {kk: (v[v["warmup"] == 0] if isinstance(v, pd.DataFrame) and "warmup" in v.columns else v) for kk, v in base.items()}
+    val_res, test_res = [], []
+    for i, va in enumerate(folds, 1):
+        va_s = {stem(f) for f in va}
+        D2 = dict(base)
+        D2["tr"], D2["va"] = base["all"][~base["all"]["file"].isin(va_s)], base["all"][base["all"]["file"].isin(va_s)]
+        D2["cva"] = base["cal_all"][base["cal_all"]["file"].isin(va_s)]
+        if kind == "lgbm":
+            r = run_supervised(f"{name}_fold{i}", D2, cols, write=False)
+        else:
+            r, _ = run_unsup(f"{name}_fold{i}", D2, cols, iforest_fit, lambda m, df: iforest_score(m, df, cols), write=False)
+        val_res.append(r["val"])
+        test_res.append(r["test"])
+    keys = ("auroc", "auroc_gun_mean", "auprc", "recall_pre_failure", "alarm_rate_normal")
+
+    def agg(rs):
+        return {"mean": {kk: float(np.nanmean([r[kk] for r in rs])) for kk in keys},
+                "sd": {kk: float(np.nanstd([r[kk] for r in rs])) for kk in keys},
+                "files_with_final_run": int(sum(r["operating_point"]["files_with_final_run"] for r in rs)),
+                "files_both_ok": int(sum(r["operating_point"]["files_both_ok"] for r in rs)),
+                "files": int(sum(r["operating_point"]["files"] for r in rs))}
+
+    res = {"name": name, "note": note, "kind": kind, "label_window": L or 3600, "drop_warmup": drop_warmup, "k": k,
+           "n_features": len(cols), "val_folds": agg(val_res), "test_over_folds": agg(test_res),
+           "folds": [{"val_files": sorted({stem(f) for f in va}), **{kk: r[kk] for kk in keys}} for va, r in zip(folds, val_res)]}
+    os.makedirs(OUT3, exist_ok=True)
+    with open(os.path.join(OUT3, f"{name}.json"), "w", encoding="utf-8") as f:
+        json.dump(res, f, indent=1, default=str)
+    v, t = res["val_folds"], res["test_over_folds"]
+    log(f"== {name:<24} {len(cols):>3} feats | cv AUROC {v['mean']['auroc']:.3f}+-{v['sd']['auroc']:.3f} "
+        f"per-gun {v['mean']['auroc_gun_mean']:.3f}+-{v['sd']['auroc_gun_mean']:.3f} recall {v['mean']['recall_pre_failure']:.3f} "
+        f"alarm {v['mean']['alarm_rate_normal']:.3f} op {v['files_both_ok']}/{v['files']} | test AUROC {t['mean']['auroc']:.3f}"
+        f"+-{t['sd']['auroc']:.3f} per-gun {t['mean']['auroc_gun_mean']:.3f} recall {t['mean']['recall_pre_failure']:.3f}")
+    return res
+
+
+def exp_p3_labelcv(D):
+    D = without(D, ["c19"])
+    for L in (900, 1800, 2700, 3600, 7200):
+        for kind in ("iforest", "lgbm"):
+            cv_run(f"p3_labelcv_{L}_{kind}", D, D["model_cols"], kind, L,
+                   note=f"{kind}, pre-failure window {L} s, 46 features (c19 dropped)")
+
+
+def exp_p3_maint(D):
+    D = add_maint(without(D, ["c19"]))
+    for L in (1800, 3600):
+        for kind in ("iforest", "lgbm"):
+            for tag, cols in (("base", D["model_cols"]), ("maint", D["model_cols"] + MAINT_COLS)):
+                cv_run(f"p3_maint_{tag}_{L}_{kind}", D, cols, kind, L, drop_warmup=True,
+                       note=f"{kind}, {len(cols)} features, pre-failure {L} s, first 6 h of every gun dropped (maintenance "
+                            "lookbacks are incomplete there)")
+
+
 ALL = ["noc19_base60", "clean_base60", "noc19_sup60", "clean_sup60", "clean_sup300", "clean_hist_std60", "clean_sup_hist60",
        "clean_labelwin_1800", "clean_labelwin_7200", "clean_labelwin_21600", "clean_cv4", "clean_ewma5", "clean_base300",
        "base60", "hist_std60", "hist_all60", "base300", "hist_std300", "ewma5", "ewma15", "cusum", "lstm_ae60",
@@ -478,6 +613,11 @@ def run(names):
         else:
             D60 = D60 or load(60)
             D = D60
+        if n in ("p3_labelcv", "p3_maint"):
+            D60 = D60 or load(60)
+            (exp_p3_labelcv if n == "p3_labelcv" else exp_p3_maint)(D60)
+            log(f"   ({n} done in {time.time() - t0:.0f}s)")
+            continue
         prefix = n.split("_", 1)[0]
         if prefix in DROP:
             D = without(D, DROP[prefix])
@@ -563,10 +703,13 @@ def main():
     c.add_argument("--window", type=int, default=60)
     r = sub.add_parser("run")
     r.add_argument("names", nargs="+")
+    sub.add_parser("cache-maint")
     sub.add_parser("summary")
     args = ap.parse_args()
     if args.cmd == "cache":
         build_cache(args.window)
+    elif args.cmd == "cache-maint":
+        build_maint_cache()
     elif args.cmd == "run":
         run(args.names)
     else:

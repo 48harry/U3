@@ -185,6 +185,8 @@ class ModelInfo(BaseModel):
     gun_warmup_s: int | None = Field(None, description="warm-up length per gun stream")
     gun_threshold_q: float | None = Field(None, description="quantile of the warm-up scores used as the gun's threshold (None = global)")
     rule_cooldown_s: int = Field(description="after a terminal-code rule trigger the rule stays quiet this long per gun")
+    rule_repeat_s: int | None = Field(None, description="a trigger whose code already fired this long before in the same "
+                                                        "gun is a repeat: reported, not critical (None = no repeat check)")
 
 
 # ------------------------------------------------------------ ML -> RAG handoff (rag_mapping.build_handoff)
@@ -313,8 +315,11 @@ class AnomalyResult(BaseModel):
                     ">= sustain x window seconds), OR the terminal-code rule fired in this request (rule_triggered)")
     rule_triggered: bool = Field(False, description="a terminal-code episode (E012/E016/E028/E029) STARTED in this request's "
                                                     "rows and the gun's rule cooldown had expired: severity is forced to "
-                                                    "critical regardless of the model. Fires once per episode, not while "
-                                                    "the code persists")
+                                                    "critical regardless of the model, unless rule_repeat. Fires once per "
+                                                    "episode, not while the code persists")
+    rule_repeat: bool = Field(False, description="the rule fired, but the same code already fired in this gun within "
+                                                 "model.rule_repeat_s: severity warning, no handoff (repeats were false in "
+                                                 "17 of 18 cases, history.md §11)")
     rule_trigger_time: datetime | None = Field(None, description="timestamp of the row that fired the rule")
     rule_code: str | None = Field(None, description="the terminal code that fired the rule (it may have cleared by window_end)")
     rule_class_hint: FaultClass | None = Field(None, description="fault class of rule_code - use this, not "
@@ -405,12 +410,14 @@ class Detector:
         rule = b.get("rule") or {"codes": list(trainlib.TERMINAL_CODES), "cooldown_s": trainlib.RULE_COOLDOWN_S}
         self.rule_codes: list[str] = list(rule["codes"])
         self.rule_cooldown_s: int = int(rule["cooldown_s"])
+        self.rule_repeat_s: int | None = None if rule.get("repeat_s") is None else int(rule["repeat_s"])
         self.info = ModelInfo(name=os.path.splitext(os.path.basename(path))[0], type=str(b.get("model_type", "?")),
                               created=str(b.get("created", "?")), window_s=self.window, threshold=self.threshold,
                               threshold_q=float(b.get("threshold_q", float("nan"))), sustain=self.sustain,
                               n_features=len(self.model_cols), alarm_max_non_welding=self.alarm_max_non_welding,
                               gun_norm=(gn or {}).get("mode", "none"), gun_warmup_s=(gn or {}).get("warmup_s"),
-                              gun_threshold_q=(gn or {}).get("threshold_q"), rule_cooldown_s=self.rule_cooldown_s)
+                              gun_threshold_q=(gn or {}).get("threshold_q"), rule_cooldown_s=self.rule_cooldown_s,
+                              rule_repeat_s=self.rule_repeat_s)
 
     # ---- per-gun normalisation, the online counterpart of train.window_file()
     def gun_normalise(self, g: "GunState", f: pd.DataFrame) -> tuple[pd.DataFrame, float]:
@@ -475,9 +482,10 @@ class Detector:
             return g.gun_threshold
         return self.threshold
 
-    # ---- terminal-code rule: fires on an episode start, then keeps quiet for rule_cooldown_s
-    def rule_check(self, g: "GunState", code: pd.Series) -> tuple[pd.Timestamp, str] | None:
-        """Scan the rows not seen yet; return (time, code) of the first trigger, None if the rule did not fire."""
+    # ---- terminal-code rule: fires on an episode start, then keeps quiet for rule_cooldown_s (train.rule_triggers);
+    # a trigger whose code already fired within rule_repeat_s is a repeat (train.rule_repeats)
+    def rule_check(self, g: "GunState", code: pd.Series) -> tuple[pd.Timestamp, str, bool] | None:
+        """Scan the rows not seen yet; return (time, code, repeat) of the first trigger, None if the rule did not fire."""
         new = code[code.index > g.rule_seen] if g.rule_seen is not None else code
         if new.empty:
             return None
@@ -486,8 +494,11 @@ class Detector:
         fired = None
         for t in new.index[onset.to_numpy()]:
             if g.rule_last_trigger is None or (t - g.rule_last_trigger).total_seconds() >= self.rule_cooldown_s:
-                g.rule_last_trigger = t
-                fired = fired or (t, str(new.loc[t]))
+                c, prev_t = str(new.loc[t]), g.rule_last_by_code.get(str(new.loc[t]))
+                repeat = (self.rule_repeat_s is not None and prev_t is not None
+                          and (t - prev_t).total_seconds() < self.rule_repeat_s)
+                g.rule_last_trigger, g.rule_last_by_code[c] = t, t
+                fired = fired or (t, c, repeat)
         g.rule_seen, g.rule_prev_code = new.index[-1], str(new.iloc[-1])
         return fired
 
@@ -587,6 +598,7 @@ class GunState:
         self.rule_seen: pd.Timestamp | None = None
         self.rule_prev_code = "0"
         self.rule_last_trigger: pd.Timestamp | None = None
+        self.rule_last_by_code: dict[str, pd.Timestamp] = {}  # repeat check
         # sensor values of the latest welding row: what non-welding rows carry once it has left the buffer
         self.carry: pd.Series | None = None
         # per-gun normalisation: rows collected during the warm-up, then the fixed statistics
@@ -690,10 +702,13 @@ async def predict(req: PredictRequest, request: Request, background: BackgroundT
         g.last_score = score
         latest_code = str(w["error_code"].iloc[-1])
         # terminal-code rule (history.md P2-1 / MVP review): the model scores the terminal state below threshold, so
-        # the rule forces critical - once per episode start, then quiet for rule_cooldown_s
+        # the rule forces critical - once per episode start, then quiet for rule_cooldown_s; a repeat only warns
         rule_hit = rule is not None
-        severity = "critical" if (sustained or rule_hit) else "warning" if alarm else "normal"
-        severity_source = ("model+rule" if sustained and rule_hit else "model" if sustained else "rule" if rule_hit else "none")
+        rule_repeat = rule_hit and rule[2]
+        rule_critical = rule_hit and not rule_repeat
+        severity = "critical" if (sustained or rule_critical) else "warning" if (alarm or rule_repeat) else "normal"
+        severity_source = ("model+rule" if sustained and rule_critical else "model" if sustained
+                           else "rule" if rule_critical else "none")
         ctx = WindowContext(latest_error_code=latest_code,
                             error_active_share=float(w["error_active"].mean()),
                             non_welding_share=nw_share,
@@ -710,17 +725,17 @@ async def predict(req: PredictRequest, request: Request, background: BackgroundT
             hold_reason=f"non_welding_share {nw_share:.2f} > gate {d.alarm_max_non_welding}" if held else None,
             threshold=threshold, gun_norm=g.norm_status, gun_threshold=g.gun_threshold,
             score_z=(score - d.score_mean) / d.score_std,
-            severity=severity, rule_triggered=rule_hit,
+            severity=severity, rule_triggered=rule_hit, rule_repeat=rule_repeat,
             rule_trigger_time=rule[0].to_pydatetime() if rule_hit else None,
             rule_code=rule[1] if rule_hit else None, rule_class_hint=CODE_TO_CLASS.get(rule[1]) if rule_hit else None,
             rule_code_active=latest_code in d.rule_codes, severity_source=severity_source,
             sustained_alarm=sustained, consecutive_alarms=g.consecutive_alarms, alarm_duration_s=duration,
             windows_scored=len(ends), sustained_in_request=sustained_in_request,
-            critical_in_request=sustained_in_request or rule_hit,
+            critical_in_request=sustained_in_request or rule_critical,
             contributing_features=feats, context=ctx, model=d.info)
-        # ML -> RAG handoff: once per critical episode, and on every rule trigger (same events replay.py prints)
+        # ML -> RAG handoff: once per critical episode, and on every non-repeat rule trigger (same events replay.py prints)
         critical = result.critical_in_request
-        if (critical and not g.was_critical) or rule_hit:
+        if (critical and not g.was_critical) or rule_critical:
             result.handoff = RagHandoff(**rag_mapping.build_handoff(result.model_dump(mode="json")))
             rec = HandoffRecord(handoff=result.handoff, created_at=datetime.now(timezone.utc),
                                 delivery="pending" if request.app.state.rag_url else "pull_only")

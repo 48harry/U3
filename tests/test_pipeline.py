@@ -165,7 +165,11 @@ def test_3_train_and_evaluate(workspace):
     rule = metrics["metrics"]["test"]["rule_terminal_code"]
     assert rule["flag"] == "terminal_any" and rule["n_triggers"] == 2 and rule["files_hit"] == 2
     assert rule["files_with_false_trigger"] == 0 and 4 <= rule["rule_lead_min_median"] <= 5
-    assert metrics["rule"] == {"codes": ["E012", "E016", "E028", "E029"], "cooldown_s": 1800}
+    assert rule["n_repeats"] == 0 and rule["repeat_s"] == 86400
+    assert metrics["rule"] == {"codes": ["E012", "E016", "E028", "E029"], "cooldown_s": 1800, "repeat_s": 86400}
+    # per-gun AUROC next to the pooled one
+    assert all(v["auroc"] == v["auroc"] for v in metrics["metrics"]["test"]["per_file"].values())
+    assert metrics["metrics"]["test"]["auroc_gun_mean"] > 0.5
 
     out = run(os.path.join(PY, "train.py"), "--evaluate", "--data-dir", workspace["pre"], "--model-dir", workspace["models"])
     assert "saved" in out
@@ -202,6 +206,18 @@ def test_3b_rule_triggers():
     assert np.flatnonzero(rule_triggers(flags, ttf, cooldown_s=1800)).tolist() == [1]
     assert np.flatnonzero(rule_triggers(flags, ttf, cooldown_s=60)).tolist() == [1, 4, 7]
     assert np.flatnonzero(rule_triggers(flags, ttf, cooldown_s=240)).tolist() == [1, 7]
+
+
+def test_3c_rule_repeats():
+    """A trigger whose code already triggered less than repeat_s earlier is a repeat; another code is not."""
+    from train import rule_repeats
+
+    trig = np.array([1, 0, 1, 0, 1, 1], dtype=bool)
+    code = np.array([4, 0, 4, 0, 1, 4])
+    ttf = np.array([100, 90, 60, 50, 40, 0]) * 3600.0  # hours before failure
+    assert np.flatnonzero(rule_repeats(trig, code, ttf, repeat_s=24 * 3600)).tolist() == []  # 40 h and 60 h apart
+    assert np.flatnonzero(rule_repeats(trig, code, ttf, repeat_s=48 * 3600)).tolist() == [2]
+    assert np.flatnonzero(rule_repeats(trig, code, ttf, repeat_s=61 * 3600)).tolist() == [2, 5]
 
 
 def test_4_api_matches_offline(workspace):
@@ -312,6 +328,10 @@ def test_4_api_matches_offline(workspace):
         assert client.delete("/guns/G1").status_code == 404
 
 
+def card_repeat(client):
+    return client.get("/model").json()["model"]["rule_repeat_s"]
+
+
 def test_5_api_chunks_sustain_rule(workspace):
     """Chunk limit, time-based sustained alarm, and the edge-triggered terminal-code rule with cooldown."""
     os.environ["RSW_MODEL_PATH"] = str(workspace["models"] / "baseline_iforest.joblib")
@@ -370,6 +390,22 @@ def test_5_api_chunks_sustain_rule(workspace):
                 elif not res["sustained_alarm"]:
                     assert res["severity"] != "critical", "a persisting terminal code alone is not critical"
         assert sum(triggers) == 1 and active >= 1
+
+        # the same code firing again after the cooldown but within rule_repeat_s is a repeat: reported, not critical
+        assert card_repeat(client) == 86400
+        part = raw.iloc[:2280].copy()
+        part.loc[150:199, "error"] = "E029"
+        part.loc[2100:2149, "error"] = "E029"  # 32.5 min later: past the 30-min cooldown
+        fired = []
+        for i in range(0, 2280, 60):
+            r = post(client, "R2", part.iloc[i: i + 60])
+            if r.status_code == 200 and r.json()["rule_triggered"]:
+                fired.append(r.json())
+        assert [f["rule_repeat"] for f in fired] == [False, True]
+        assert fired[0]["severity"] == "critical" and fired[0]["handoff"] is not None
+        rep = fired[1]
+        assert rep["severity_source"] in ("none", "model") and rep["handoff"] is None
+        assert rep["severity"] == "critical" if rep["sustained_in_request"] else rep["severity"] == "warning"
 
         # a cap-dressing block longer than the 30-min buffer: the non-welding rows keep carrying the last welding
         # values (regression: the buffer held no welding row any more -> NaN features -> HTTP 500 on real test_0)

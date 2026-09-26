@@ -148,9 +148,10 @@ def match_symptoms(findings: list[dict[str, Any]], context: dict[str, Any]) -> l
 
 
 def resolve_class(result: dict[str, Any]) -> dict[str, Any] | None:
-    """The fault class the terminal-code rule points to (rule_class_hint first, then the latest code)."""
+    """The fault class the terminal-code rule points to (rule_class_hint first, then the latest code). A repeat
+    trigger (rule_repeat: the code already fired in this gun within a day) is not critical and not a rule basis."""
     ctx = result.get("context") or {}
-    if result.get("rule_triggered") and result.get("rule_class_hint"):
+    if result.get("rule_triggered") and not result.get("rule_repeat") and result.get("rule_class_hint"):
         code, basis = result["rule_class_hint"], "rule_trigger"
     elif ctx.get("known_code_class_hint"):
         code, basis = ctx["known_code_class_hint"], "latest_error_code"
@@ -201,6 +202,7 @@ def build_handoff(result: dict[str, Any], event_id: str | None = None) -> dict[s
     """Full handoff document (schema v1.0) for one critical event. `result` = AnomalyResult.model_dump(mode='json')."""
     ctx = result.get("context") or {}
     model = result.get("model") or {}
+    rule = bool(result.get("rule_triggered")) and not result.get("rule_repeat")  # a repeat did not trigger this event
     return {
         "schema_version": SCHEMA_VERSION,
         "event_id": event_id or uuid.uuid4().hex,
@@ -208,9 +210,9 @@ def build_handoff(result: dict[str, Any], event_id: str | None = None) -> dict[s
         "detected_at": str(result["window_end"]),
         "window_start": str(result["window_start"]),
         "trigger": {"source": result.get("severity_source", "none"),
-                    "rule_code": result.get("rule_code"),
-                    "rule_trigger_time": None if result.get("rule_trigger_time") is None
-                    else str(result["rule_trigger_time"]),
+                    "rule_code": result.get("rule_code") if rule else None,
+                    "rule_trigger_time": str(result["rule_trigger_time"]) if rule and result.get("rule_trigger_time")
+                    else None,
                     "anomaly_score": result.get("anomaly_score"), "threshold": result.get("threshold"),
                     "score_z": result.get("score_z"), "alarm_duration_s": result.get("alarm_duration_s", 0),
                     "sustained": bool(result.get("sustained_in_request") or result.get("sustained_alarm"))},

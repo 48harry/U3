@@ -4,7 +4,7 @@
 
 - **0~4절**: 데이터와 논문, 접근 방식, 데이터에서 확인한 사실 — *무엇을 왜 하는가*
 - **5절**: 구현 워크플로우 — *무엇을 어떤 순서로 돌리면 무엇이 나오는가*
-- `test.md`: 현재 모델의 테스트셋 판정과 결과. `MEMORY.md`: 설계 결정과 그 근거. `history.md`: 변경·실험 기록(무엇을 언제 왜 바꿨고 그때 수치가 어땠나).
+- `test.md`: 현재 모델의 테스트셋 판정과 결과. `MEMORY.md`: 설계 결정과 그 근거. `history.md`: 변경·실험 기록(무엇을 언제 왜 바꿨고 그때 수치가 어땠나). `techspec.md`: 앞으로 개발할 것(ML 파트와 RAG 핸드오프 범위, 우선순위·설계·완료 기준).
 - `readme.md`·`test.md`는 **항상 최신 상태와 결과만** 담는다. 바뀐 경위와 이전 수치는 `history.md`에 쌓는다.
 
 표기: **〔확인〕** = 72파일 EDA로 실측 확인(5.3절), **〔메모〕** = 미결 사항·유의점.
@@ -220,7 +220,7 @@ E01·E03·E04는 2021년 8~10월에 몰려 있는데, **E02는 2019년 12월~202
                                               models/baseline_iforest_metrics.json
                   .py/train.py --evaluate ──► models/baseline_iforest_test_metrics.json, models/scores/test_N_iforest.csv
                   .py/experiments.py ───────► results/p1p2/*.json   (P1·P2 실험, 운영과 무관)
- models/ ───────► main.py (FastAPI) ────────► AnomalyResult JSON ──► 온톨로지 / RAG / LLM 리포트 / Slack (3절, 미구현)
+ models/ ───────► main.py (FastAPI) ────────► AnomalyResult JSON + RAG 핸드오프(5.10절) ──► 온톨로지 / RAG / LLM 리포트 / Slack (다른 담당, 미구현)
  test/*.csv ───► .py/replay.py ──(HTTP)──► main.py /predict   (원본 CSV를 실시간 스트림처럼 재생)
 ```
 
@@ -510,8 +510,8 @@ parquet 한 파일은 **35개 컬럼**이다. 그중 **24개만 모델 입력**�
 - **건별 정규화**: 파일(스트림)의 첫 6시간 중 정상·용접 행의 평균을 이후 행의 z-score 입력 19개에서 뺀다(`--gun-norm center`; 건 상수 c7~c9는 0이 됨). 워밍업 6시간은 글로벌 스케일로 점수화하고 `warmup` 플래그를 단다. 정상·용접 행이 600개 미만이면 그 파일은 글로벌 유지. `--gun-norm scale`(std까지 나눔)은 워밍업이 대기 상태인 건에서 폭주하므로 쓰지 않는다(`test.md` 4절)
 - 임계값 = 학습 정상 점수의 99% 분위수(글로벌 0.5251, 오탐률 1% 설계). **건별 임계값** = max(글로벌, 워밍업 윈도우를 건별 통계로 재정규화한 점수의 99% 분위수) — 기본 켜짐, `--no-gun-threshold`로 해제. `sustain=3` 연속 초과 = 지속 알람
 - **비용접 게이트**: 윈도우의 비용접 비율이 `--alarm-max-non-welding`(기본 0.5, `none`으로 해제)을 넘으면 임계값을 넘어도 알람으로 세지 않는다(보류). 값은 번들에 들어가 서빙도 같은 규칙을 쓴다. 지표에 보류된 알람 수(`held_windows`)·게이트 대상 윈도우 비율(`held_share_of_windows`)·용접 윈도우만의 AUROC(`auroc_welding_windows`)가 함께 나온다
-- 평가 = AUROC/AUPRC(고장 전 1h vs 정상), 정상 알람률, 클래스별, 파일별 "고장으로 이어지는 마지막 알람 구간 시작 시각"과 "24h 이전 오탐 에피소드/일". 여기에 **운영점**(`operating_point`: 선행 ≥30분 **그리고** 오탐 ≤1회/일/건을 만족한 건 수)과 **종료 코드 규칙 기준선**(`rule_terminal_code`: 종료 코드 윈도우를 알람으로 쳤을 때의 선행·에러 상태 알람률)이 항상 같이 나온다
-- `--cv 4`: 건 단위 층화 4-fold를 먼저 돌려 `metrics["cv"]`에 폴드별·평균±편차를 남긴다(한 분할의 AUROC는 ±0.04 흔들린다). `--label-window 1800`: 레이블 창을 바꿔 평가(전처리 재실행 불필요)
+- 평가 = AUROC/AUPRC(고장 전 1h vs 정상), 정상 알람률, 클래스별, 파일별 "고장으로 이어지는 마지막 알람 구간 시작 시각"과 "24h 이전 오탐 에피소드/일". AUROC는 세 가지로 본다: 풀링(`auroc`), **건별 평균**(`auroc_gun_mean`, 파일별 `per_file[*].auroc` — 건 간 점수 오프셋이 빠진 건 안 분리력), **규칙 이전**(`auroc_pre_rule` — 고장 10분 이전 전조 윈도우만 양성. 마지막 10분은 종료 코드 규칙이 잡으므로 모델이 더하는 몫은 이것). 여기에 **운영점**(`operating_point`: 선행 ≥30분 **그리고** 오탐 ≤1회/일/건을 만족한 건 수)과 **종료 코드 규칙 기준선**(`rule_terminal_code`: 서빙과 같은 발화 규칙의 적중·선행·critical 오트리거/일, 24h 반복 강등 수 `n_repeats`)이 항상 같이 나온다
+- `--cv 4`: 건 단위 층화 4-fold를 먼저 돌려 `metrics["cv"]`에 폴드별·평균±편차를 남긴다(한 분할의 AUROC는 ±0.04 흔들린다 — 구성 비교는 이것으로). `--label-window 1800`: 레이블 창을 바꿔 평가(전처리 재실행 불필요). 창을 좁히면 AUROC가 오르지만 이득은 전부 마지막 10분에서 나오므로 기본 1시간을 유지한다(`history.md` 11.4)
 - 검증 후 `preprocessed/test/`가 있으면 **같은 임계값으로 테스트도 자동 평가**해 `metrics["test"]`에 넣는다(`--no-test`로 생략)
 
 현재 모델(c19 제거·46피처; 이전 모델의 수치 추이는 `history.md`):
@@ -520,8 +520,8 @@ parquet 한 파일은 **35개 컬럼**이다. 그중 **24개만 모델 입력**�
 
 | | AUROC | recall@1h | 정상 알람률 | 건별 정상 알람률 |
 |---|---|---|---|---|
-| 전체 | 0.647 | 0.030 | 0.010 | 0.1~4.0% (sd 1.1%) |
-| 4-fold (64건) | 0.631 ± 0.038 | 0.024 ± 0.007 | 0.014 ± 0.007 | |
+| 전체 | 0.647 (건별 0.706, 규칙 이전 0.606) | 0.030 | 0.010 | 0.1~4.0% (sd 1.1%) |
+| 4-fold (64건) | 0.631 ± 0.038 (건별 0.665 ± 0.040, 규칙 이전 0.586 ± 0.040) | 0.024 ± 0.007 | 0.014 ± 0.007 | |
 | E01 | 0.683 | 0.012 | 0.004 | |
 | E02 | 0.743 | 0.083 | 0.016 | |
 | E03 | 0.627 | 0.039 | 0.009 | |
@@ -531,13 +531,13 @@ parquet 한 파일은 **35개 컬럼**이다. 그중 **24개만 모델 입력**�
 
 | | AUROC | recall@1h | 정상 알람률 | 건별 정상 알람률 |
 |---|---|---|---|---|
-| 전체 | 0.636 | 0.029 | 0.005 | **0.02~1.0%** (sd 0.3%) |
+| 전체 | 0.636 (건별 0.637, 0.24~0.89; 규칙 이전 0.611) | 0.029 | 0.005 | **0.02~1.0%** (sd 0.3%) |
 | E01 (2) | 0.346 | 0.000 | 0.008 | |
 | E02 (1) | 0.894 | 0.100 | 0.002 | |
 | E03 (2) | 0.683 | 0.025 | 0.001 | |
 | E04 (3) | 0.644 | 0.028 | 0.007 | |
 
-운영점(선행 ≥30분 & 오탐 ≤1회/일): 검증 0/14, 테스트 0/8. 고장으로 이어지는 지속 알람 0/8. 종료 코드 규칙 기준선: 8/8건, 선행 중앙값 9.1분.
+운영점(선행 ≥30분 & 오탐 ≤1회/일): 검증 0/14, 테스트 0/8. 고장으로 이어지는 지속 알람 0/8. 종료 코드 규칙 기준선: 8/8건, 선행 중앙값 9.2분, critical 오트리거 0.18회/일/건(반복 강등 4회, 강등하지 않으면 0.25).
 
 → 오탐률은 설계대로 1% 미만이고 건별 편차도 사라졌지만 **고장 전 1시간을 거의 못 잡는다**. c19를 뺀 지도학습 상한선이 0.62~0.70으로 같은 수준이므로 이 피처에는 그 정보가 없다(`test.md` 3절). 종료 상태(E029 등)는 모델이 아니라 규칙(`rule_triggered`)이 잡는다. 파일별 결과와 원인은 **`test.md`**, 절제 실험 경과는 **`history.md`**에 있다.
 
@@ -548,9 +548,9 @@ parquet 한 파일은 **35개 컬럼**이다. 그중 **24개만 모델 입력**�
 | `baseline_iforest.joblib` | `{model, feature_cols, model_cols, window, threshold, sustain, alarm_max_non_welding, gun_norm, dropped_features, scaler, preprocess_config, feature_reference, feature_scale, metrics, train_files, val_files, args, created}` — 서빙에 필요한 것이 전부 들어 있다. `gun_norm` = `{mode, warmup_s, min_rows, std_floor, threshold_q, columns}`. `metrics`에는 검증·테스트 외에 `cv`(건 단위 k-fold)가 있고, 각 평가에는 `operating_point`(선행 ≥30분 & 오탐 ≤1/일 충족 건 수)와 `rule_terminal_code`(종료 코드 규칙 기준선)가 들어 있다 |
 | `baseline_iforest_metrics.json` | 위에서 `model`만 뺀 것 |
 | `baseline_iforest_test_metrics.json` | `--evaluate` 결과 |
-| `scores/test_N_iforest.csv` | `--evaluate`가 쓰는 파일별 윈도우 점수(`score, alarm, threshold, ttf_s, label, error_active, non_welding, warmup`) — `threshold`는 그 윈도우를 판정한 값(워밍업은 글로벌, 이후는 건별) |
+| `scores/test_N_iforest.csv` | `--evaluate`가 쓰는 파일별 윈도우 점수(`score, alarm, threshold, ttf_s, label, error_active, terminal_any, terminal_idx, non_welding, warmup`) — `threshold`는 그 윈도우를 판정한 값(워밍업은 글로벌, 이후는 건별) |
 
-다른 진입점: `--evaluate`(학습 없이 저장 번들로 테스트만), `--score <parquet>`(파일 하나 스코어링 → `models/scores/`), `--model pca`, `--window 120`, `--alarm-max-non-welding none`(게이트 해제), `--gun-norm none`·`--no-gun-threshold`·`--warmup-hours 6`(건별 정규화 관련), `--drop-features`(기본 `c19`), `--cv 4`(건 단위 k-fold), `--label-window 1800`(레이블 창 변경), `--max-files 8`(빠른 확인). 현재 `models/`의 번들은 `python .py/train.py --exclude-non-welding --cv 4`로 만든 것이다. 절제 실험 지표는 `results/p0/`(P0), `results/p1p2/`(P1·P2, `.py/experiments.py`가 만든다)에 있다. 코드에서는 `from train import load_bundle, score_frame`.
+다른 진입점: `--evaluate`(학습 없이 저장 번들로 테스트만), `--score <parquet>`(파일 하나 스코어링 → `models/scores/`), `--model pca`, `--window 120`, `--alarm-max-non-welding none`(게이트 해제), `--gun-norm none`·`--no-gun-threshold`·`--warmup-hours 6`(건별 정규화 관련), `--drop-features`(기본 `c19`), `--cv 4`(건 단위 k-fold), `--label-window 1800`(레이블 창 변경), `--max-files 8`(빠른 확인). 현재 `models/`의 번들은 `python .py/train.py --exclude-non-welding --cv 4`로 만든 것이다. 절제 실험 지표는 `results/p0/`(P0), `results/p1p2/`(P1·P2), `results/p3/`(P3: 레이블 창·정비 이력 4-fold; P1·P2·P3 모두 `.py/experiments.py`가 만든다)에 있다. 코드에서는 `from train import load_bundle, score_frame`.
 
 ##### 5.6.1 윈도우 처리 상세
 
@@ -570,7 +570,7 @@ df.groupby([df["segment_id"], pd.Grouper(freq="60s")])
 | 대상 | 집계 | 결과 컬럼 | 모델 입력 |
 |---|---|---|---|
 | 연속 피처 24개 (모델 입력은 c19를 뺀 23개) | `mean` + `std` | `c5_mean`, `c5_std` … | ✅ **46개** (c19 제외) |
-| `error_active`, `terminal_code`, `label` | `max` | 같은 이름 | ❌ 평가·정상구간 판정용 |
+| `error_active`, `terminal_code`, `terminal_any`, `terminal_idx`, `label` | `max` | 같은 이름 | ❌ 평가·정상구간 판정용 (`terminal_idx` 1~4 = 어느 종료 코드인지, 규칙 반복 판정용) |
 | `non_welding` | `mean` | `non_welding_mean` | ❌ 비용접 비율 |
 | `ttf_s` | `min` | `ttf_s` | ❌ 평가축 |
 | 샘플 수 | `size` | `n` | ❌ 품질 필터 |
@@ -614,8 +614,8 @@ g.columns = [f"{a}_{b}" if a in feat_cols and b in ("mean", "std") else a for a,
 | GET | `/model` | 모델 카드: 윈도우·임계값·피처(`dropped_features` 포함)·전처리 파라미터·건별 정규화 레시피·검증/테스트 지표·파일 목록 |
 | GET | `/health`, `/guns` | 상태 / 건별 버퍼·연속 알람·워밍업 상태(`gun_norm`, `gun_threshold`, `warmup_rows`) |
 | DELETE | `/guns/{gun_id}` | 버퍼 리셋(정비 후) |
-| GET | `/handoffs`, `/handoffs/{event_id}` | critical 이벤트의 RAG 핸드오프 문서와 전달 상태(5.10절) |
-| POST | `/handoffs/preview` | `AnomalyResult` JSON → 핸드오프 문서(서버 상태 무관, RAG 쪽 테스트용) |
+
+RAG 핸드오프 엔드포인트(`/handoffs`, `/handoffs/{event_id}`, `/handoffs/preview`)와 응답의 `handoff` 필드는 5.10.3절.
 
 입력 `SensorReading` = CSV 컬럼 그대로(`time, c1~c19, error`; `c10`은 on/off·bool 허용, `error`는 `^(0|E\d{3})$`).
 
@@ -624,7 +624,7 @@ g.columns = [f"{a}_{b}" if a in feat_cols and b in ("mean", "std") else a for a,
 ```json
 {"gun_id": "G0", "status": "ok", "window_start": "...", "window_end": "...", "n_samples": 60, "history_s": 1809,
  "is_anomaly": true, "anomaly_score": 0.61, "threshold": 0.58, "gun_norm": "gun", "gun_threshold": 0.58, "score_z": 4.6,
- "severity": "critical", "rule_triggered": true, "rule_trigger_time": "...", "rule_code": "E029", "rule_class_hint": "E04",
+ "severity": "critical", "rule_triggered": true, "rule_repeat": false, "rule_trigger_time": "...", "rule_code": "E029", "rule_class_hint": "E04",
  "rule_code_active": true, "severity_source": "model+rule", "sustained_alarm": true, "sustained_in_request": true,
  "consecutive_alarms": 3, "alarm_duration_s": 180, "windows_scored": 1, "critical_in_request": true,
  "alarm_held": false, "hold_reason": null,
@@ -634,11 +634,11 @@ g.columns = [f"{a}_{b}" if a in feat_cols and b in ("mean", "std") else a for a,
              "welds_in_window": 0, "welds_10min": 12, "weld_duty_10min": 0.02, "known_code_class_hint": "E04"},
  "model": {"name": "baseline_iforest", "type": "iforest", "created": "...", "window_s": 60, "threshold": 0.54,
            "threshold_q": 0.99, "sustain": 3, "alarm_max_non_welding": 0.5, "gun_norm": "center", "gun_warmup_s": 21600,
-           "gun_threshold_q": 0.99, "n_features": 46}}
+           "gun_threshold_q": 0.99, "n_features": 46, "rule_cooldown_s": 1800, "rule_repeat_s": 86400}}
 ```
 
 - `threshold`: **이 윈도우를 판정한 임계값** — 워밍업이 끝난 건은 `gun_threshold`, 그 전·글로벌 건은 `model.threshold`(글로벌). `gun_norm`은 `warming_up` / `gun` / `global`.
-- `rule_triggered` / `severity_source`: 이 요청의 행에서 종료 코드(E012/E016/E028/E029) **에피소드가 시작**되고 건의 쿨다운(30분, `model.rule_cooldown_s`)이 지났으면 모델과 무관하게 `severity=critical`. 코드가 떠 있는 동안 계속 critical이 아니다 — E029는 E01~E03 건에서도 고장 며칠 전부터 수 시간씩 떠 있다(테스트 test_0 16시간). `rule_code`·`rule_class_hint`는 발화시킨 코드와 그 클래스(윈도우 끝에서는 코드가 이미 사라졌을 수 있으므로 온톨로지는 `context.known_code_class_hint`가 아니라 이것을 쓴다). `rule_code_active`는 최신 코드가 종료 코드인지(상태). `severity_source`는 `model`(지속 알람) / `rule` / `model+rule` / `none`. 보장되는 선행은 마지막 ~10분, 오트리거는 테스트 평균 0.25회/일/건
+- `rule_triggered` / `severity_source`: 이 요청의 행에서 종료 코드(E012/E016/E028/E029) **에피소드가 시작**되고 건의 쿨다운(30분, `model.rule_cooldown_s`)이 지났으면 모델과 무관하게 `severity=critical`. 코드가 떠 있는 동안 계속 critical이 아니다 — E029는 E01~E03 건에서도 고장 며칠 전부터 수 시간씩 떠 있다(테스트 test_0 16시간). `rule_code`·`rule_class_hint`는 발화시킨 코드와 그 클래스(윈도우 끝에서는 코드가 이미 사라졌을 수 있으므로 온톨로지는 `context.known_code_class_hint`가 아니라 이것을 쓴다). `rule_code_active`는 최신 코드가 종료 코드인지(상태). `severity_source`는 `model`(지속 알람) / `rule` / `model+rule` / `none`. 보장되는 선행은 마지막 ~10분. **`rule_repeat`**: 같은 코드가 이 건에서 24h(`model.rule_repeat_s`) 안에 이미 발화했으면 `rule_triggered=true`이지만 critical이 아니라 `warning`이고 핸드오프도 없다(`critical_in_request=false`) — 학습·테스트 80건에서 반복 발화는 18회 중 17회가 오트리거였다. critical 오트리거는 테스트 평균 0.18회/일/건(강등 전 0.25)
 - `severity`: `normal`(임계 미만) / `warning`(초과) / `critical`(임계 초과가 `sustain × window` = 180초 이상 연속, `alarm_duration_s`) — 3절의 "연속 N회일 때만 RAG 트리거" 기준. **시간 기준**이라 클라이언트 호출 주기와 무관하다(1초마다 호출해도 3초 만에 critical이 되지 않는다). `critical_in_request`는 청크 중간 윈도우가 critical이었던 경우까지 포함하므로 하류 트리거는 이 필드를 본다
 - `alarm_held`: 윈도우의 `non_welding_share`가 번들의 `alarm_max_non_welding`(0.5)을 넘으면 `true`. 이때 `is_anomaly`·점수는 그대로 주되 `severity`는 `normal`, `consecutive_alarms`는 0으로 리셋된다(비용접 중 점수는 신뢰하지 않는다). `hold_reason`에 이유가 들어간다.
 - `contributing_features`: 피처 하나를 정상 기준값(`feature_reference`)으로 치환했을 때의 점수 감소량, 상위 8개. 모델 무관 방식
@@ -663,26 +663,26 @@ python .py/replay.py test/test_0.csv --speed 60               # 60배속
 
 #### 5.8 품질 관리
 
-- `tests/test_rag_mapping.py`: 핸드오프 매핑 단위 테스트(순수 Python, 1초 미만) — 센서 방향 판정, 규칙·증상 일치 시 신뢰도, 정지 조건, 설정값 변경, 상황 ID 유효성, 원인·매뉴얼 미포함, `main.RagHandoff`와 키 일치.
+- 핸드오프 테스트(`tests/test_rag_mapping.py`와 수동 확인 절차)는 5.10.7절.
 - `pytest` → `tests/test_pipeline.py`: 합성 CSV(클래스별 2파일 + 테스트 2파일, 2시간, gap·캡 드레싱·종료 코드 포함)를 임시 폴더에서 2→3→4→4'→`--score`→5단계(`/predict`)까지 돌리고, API 점수가 오프라인 점수와 같은지 확인한다. 학습은 `--warmup-hours 0.5`로 돌려 2시간 파일에서도 건별 워밍업이 끝나게 하고, API가 워밍업 전(`warming_up`, 글로벌 임계값)과 후(`gun`, 건별 임계값·재정규화 점수가 오프라인 `window_file`/`gun_thresholds`와 일치)를 모두 재현하는지 본다. 실데이터 폴더는 건드리지 않는다. 파이프라인 코드를 고치면 이것부터 돌린다.
-- 검증 항목: 번들의 `gun_norm`·`dropped_features`(c19 제외, 46피처)·`alarm_max_non_welding`·`rule`, 점수 CSV의 `threshold`/`warmup` 열, API의 `alarm_held`(캡 드레싱 구간), `rule_triggered`(에피소드 시작 1회, 쿨다운), `gun_norm` 전·후 점수 일치, 요청 크기 한도(422), 시간 기준 지속 알람(10초 청크로 보내도 180초에 critical), 버퍼보다 긴 비용접 구간, `replay.py`로 2시간 파일 재생.
+- 검증 항목: 번들의 `gun_norm`·`dropped_features`(c19 제외, 46피처)·`alarm_max_non_welding`·`rule`, 점수 CSV의 `threshold`/`warmup` 열, API의 `alarm_held`(캡 드레싱 구간), `rule_triggered`(에피소드 시작 1회, 쿨다운)·`rule_repeat`(24h 안 같은 코드 → warning, 핸드오프 없음)·`rule_repeats` 단위 테스트, 번들 `rule.repeat_s`, 건별 AUROC, `gun_norm` 전·후 점수 일치, 요청 크기 한도(422), 시간 기준 지속 알람(10초 청크로 보내도 180초에 critical), 버퍼보다 긴 비용접 구간, `replay.py`로 2시간 파일 재생.
 - 회귀 고정: `test_2b_window_columns`는 윈도우 집계가 연속 피처(24개, 모델 입력은 그중 23개)에만 `_mean`/`_std`를 붙이고 메타데이터 이름은 그대로 두는지 확인한다. 합성 데이터의 캡 드레싱 구간을 **분 경계에서 30초 어긋나게** 만들어, `non_welding`이 `max`(=1)가 아니라 `mean`(=0.5)으로 집계되는지도 함께 검증한다.
 - `ruff check .` 통과 상태. `black .`은 `pyproject.toml` 설정(120자)을 따른다.
 - 실데이터 파이프라인을 다시 돌려야 하는 변경: 전처리 규칙(2단계 코드) → 2·3·4단계 전부. 모델·윈도우만 → 4단계. 서빙만 → 재실행 불필요(`pytest`로 확인).
 
 #### 5.9 현재 한계와 다음 단계
 
-테스트셋 판정과 결과는 `test.md`에 있다. 아래는 그 요약이다.
+테스트셋 판정과 결과는 `test.md`에 있다. 아래는 그 요약이고, 이를 해결할 개발 항목은 `techspec.md`에 있다.
 
-1. **고장 1시간 전 정보가 피처에 없다.** c19를 뺀 지도학습 상한선이 비지도와 같은 0.62~0.70이다. 운영점(선행 30분·오탐 1회/일) 충족 테스트 건 0/8. 종료 상태는 규칙(`rule_triggered`)이 마지막 ~10분을 보장한다. 다음은 모델이 아니라 **새 정보원**: 용접 단위 품질 신호(c11 증분마다의 파형 요약), 정비·캡 교체 이력, 레이블 창 재정의(30분 창이 더 잘 갈라진다).
+1. **고장 10분 이전 정보가 이 데이터에 없다.** c19를 뺀 지도학습 상한선이 비지도와 같은 0.62~0.70이고, 규칙 이전 AUROC는 ~0.6이다. 설정값 잔차·정비 이력(캡 드레싱, c1 변경)·짧은 레이블 창까지 시도했지만 일반화하는 이득은 없었다(`history.md` 11절). 이 데이터셋의 "고장"은 사실상 종료 코드 + 10분이라 규칙(`rule_triggered`)이 그 10분을 보장한다. 운영점(선행 30분·오탐 1회/일) 충족 테스트 건 0/8. 더 나아가려면 데이터셋 밖의 정보(용접 1타 파형, 실제 정비 기록)가 필요하다.
 2. 검증 분할의 불확실성: 건 단위 4-fold에서 폴드 간 AUROC 0.59~0.73. 두 구성의 차이가 ±0.04 안이면 차이가 아니다(`--cv 4`로 확인할 것).
 3. E01_0은 고장 직전 1시간의 85%가 `non_welding` — 고장이 정비 중 발생하는 패턴인지 72파일에서 확인해야 한다. 학습은 비용접 윈도우를 제외하므로 모델이 플래그를 외우는 문제는 없지만, 그런 고장은 게이트에 걸려 알람이 보류된다.
 4. 건별 워밍업의 한계: 새 건의 첫 6시간은 글로벌 기준으로만 판정되고, 워밍업이 대기 상태인 건(검증 E04_4)은 그 후에도 정상 알람률 4.0%로 남는다. 워밍업 조건을 시간이 아니라 "정상 용접 N행"으로 바꾸는 것이 후보.
 5. `c16 = 8.7`(두꺼운 판) 구간은 z-score 입력으로 들어간다. 판 두께가 다른 새 건에서는 오프셋으로 나타날 수 있다(건별 centering이 일부 흡수).
 6. 서빙 윈도우는 트레일링 60초, 학습 윈도우는 분 경계 정렬 — 정확히 맞추려면 서빙도 분 경계로 자른다.
 7. `Benchmark_fixed.py`의 실제 학습 경로는 미검증.
-8. ML → RAG 핸드오프(①② 이상 감지·증상 번역, 상황 ID)는 구현(5.10절). 원인·점검·매뉴얼(온톨로지), LLM 리포트, Slack은 다른 담당이며 미구현이다. 센서 증상 규칙은 매뉴얼 기반이고 실데이터에서 거의 맞지 않았다(5.10.5).
-9. 건별 상태(워밍업·버퍼·쿨다운)는 서버 메모리에만 있다 — 재시작하면 6시간 워밍업부터 다시 한다.
+8. 건별 상태(워밍업·버퍼·쿨다운·규칙 반복 이력)는 서버 메모리에만 있다 — 재시작하면 6시간 워밍업부터 다시 하고, 반복 판정도 초기화된다.
+9. 규칙 반복 강등의 대가: 학습 72건 중 1건은 전날 같은 코드가 한 번 떴던 탓에 고장 직전 발화가 warning으로만 나간다. critical 오트리거의 대부분(테스트 10/14)은 여전히 첫 발화이고, 전부 다른 클래스 코드다 — 건의 고장 유형을 알면 거를 수 있다.
 
 #### 5.10 ML → RAG 핸드오프 (개발 스펙 v1.0)
 
@@ -702,7 +702,7 @@ ML(이상탐지)과 온톨로지·RAG(원인·점검·매뉴얼·리포트)를 *
 ##### 5.10.2 언제 넘기나 (트리거)
 
 - critical 에피소드의 **첫 요청**(직전 요청은 critical 아님 → 이번 `critical_in_request=true`)에 1회.
-- 종료 코드 규칙이 발화할 때마다(`rule_triggered=true`; 에피소드 시작 1회 + 건별 30분 쿨다운).
+- 종료 코드 규칙이 발화할 때마다(`rule_triggered=true`; 에피소드 시작 1회 + 건별 30분 쿨다운). 단 반복 발화(`rule_repeat=true`, 같은 코드가 이 건에서 24h 안에 이미 발화)는 critical이 아니므로 넘기지 않는다. 같은 요청에서 모델이 critical이면 모델 이벤트로 넘어가되, 반복 발화는 규칙 근거로 쓰지 않는다(`trigger.rule_code = null`, `fault_class.basis`는 `latest_error_code`).
 - `replay.py`도 같은 이벤트를 찍는다(`situations=[...] | 요약`).
 
 ##### 5.10.3 어떻게 넘기나 (전달 방식)
@@ -721,10 +721,10 @@ JSON Schema는 서버의 `/docs`·`/openapi.json`.
 | 필드 | 내용 |
 |---|---|
 | `schema_version`, `event_id`, `gun_id`, `detected_at`, `window_start` | 식별. `event_id`는 UUID hex, 시각은 naive UTC ISO |
-| `trigger` | `source`(model / rule / model+rule), `rule_code`, `rule_trigger_time`, `anomaly_score`, `threshold`, `score_z`, `alarm_duration_s`, `sustained` |
+| `trigger` | `source`(model / rule / model+rule), `rule_code`·`rule_trigger_time`(이 이벤트를 일으킨 규칙 발화; 반복 발화·모델 단독이면 `null`), `anomaly_score`, `threshold`, `score_z`, `alarm_duration_s`, `sustained` |
 | `summary_ko` | 한 줄 요약. 예: "보정(밸런스) 압력(c5) 평소보다 낮음; 고장 유형 E01(보정 압력 도달 지연) 의심, 에러 코드 E012." |
 | `sensor_findings[]` | 점수의 5% 이상을 설명하고 정상 기준에서 z 1.0 이상 벗어난 피처(최대 6개, 시각 피처 제외): `sensor`, `sensor_name(_ko)`, `group`, `statistic`, `direction`(high / low / unstable), `deviation_z`, `share`, `text_ko` |
-| `fault_class` | 종료 코드 기준 고장 유형: `code`(E01~E04), `name_en`, `name_ko`, `terminal_code`, `situation_id`(S01~S04), `definition`, `basis`(rule_trigger / latest_error_code). 없으면 `null` |
+| `fault_class` | 종료 코드 기준 고장 유형: `code`(E01~E04), `name_en`, `name_ko`, `terminal_code`, `situation_id`(S01~S04), `definition`, `basis`(rule_trigger = 이 요청의 규칙 발화, 반복 제외 / latest_error_code = 최신 에러 코드). 없으면 `null` |
 | `symptoms[]` | 센서 증상 규칙(5.10.5) 매칭: `id`(P1~P9), `name_ko`, `match`, `evidence`, `related_classes`, `situation_ids`, `agrees_with_fault_class`, `confidence`(low / medium) |
 | `situation_ids` | 온톨로지에서 조회할 상황 ID, 가능성 높은 순(고장 유형의 상황이 항상 먼저) |
 | `context`, `detector`, `caveats` | 윈도우 상황, 모델 정보, 해석 한계 문구 |
@@ -733,7 +733,7 @@ JSON Schema는 서버의 `/docs`·`/openapi.json`.
 
 ##### 5.10.5 증상 규칙 (센서 → 증상 → 상황 ID)
 
-근거: `RSW용접건_매뉴얼_RAG_활용정리` §8(매뉴얼 지식). 방향은 이 gun의 워밍업 평균 대비 z-score다.
+근거: 팀 문서 「RSW용접건_매뉴얼_RAG_활용정리」 §8(매뉴얼 지식, 저장소 밖 — 데이터에서 도출한 규칙이 아니다). 방향은 이 gun의 워밍업 평균 대비 z-score다.
 
 | 증상 | 조건 (핵심 → 보조) | 관련 고장 | 상황 ID |
 |---|---|---|---|
@@ -748,12 +748,12 @@ JSON Schema는 서버의 `/docs`·`/openapi.json`.
 | P9 건 센서 정상 | 규칙 발화 + 증상 피처 없음 | — | 고장 유형이 없을 때만 S09 |
 
 - **신뢰도**: 종료 코드 규칙이 발화했고 증상의 관련 고장과 같을 때만 `medium`, 나머지 `low`. `high`는 없다.
-- **실데이터 확인(2026-09-25, 테스트 8건 마지막 12시간 재생, 10분 청크)**: 이벤트 9건 — 8건이 고장 직전 종료 코드로 올바른 상황(S01~S04)을 맨 앞에 냈고, 1건은 test_0(E01)의 고장 7시간 전 E029 오트리거(S04). 센서 증상이 매뉴얼 패턴(P1~P6)과 맞은 것은 1건(test_3 P5)뿐이고, 나머지는 설정값·US2·증상 없음이었다. **실제로 믿을 만한 키는 고장 유형에서 온 `situation_ids[0]`이다.** 데이터 점검은 `history.md` 10절.
+- **실데이터 확인(2026-09-25, 테스트 8건 마지막 12시간 재생, 10분 청크)**: 이벤트 9건 — 8건이 고장 직전 종료 코드로 올바른 상황(S01~S04)을 맨 앞에 냈고, 1건은 test_0(E01)의 고장 7시간 전 E029 오트리거(S04). 센서 증상이 매뉴얼 패턴(P1~P6)과 맞은 것은 1건(test_3 P5)뿐이고, 나머지는 설정값·US2·증상 없음이었다. 2026-09-26 규칙 반복 강등을 넣고 다시 재생해도 같다(9건, 반복 0 — 12시간 재생은 24h 반복 이력을 보지 못하지만 테스트 8건 7일 전체에서도 고장 직전 발화 중 반복은 없다). **실제로 믿을 만한 키는 고장 유형에서 온 `situation_ids[0]`이다.** 데이터 점검은 `history.md` 10절.
 - 시각(`hour_sin/cos`)은 증상으로 보고하지 않는다. c10(US2)은 이진 신호라 low를 "꺼짐(평소 켜짐)"으로 쓴다.
 
 ##### 5.10.6 RAG가 돌려줄 것 (응답 계약, push 방식)
 
-RAG 서비스는 `POST /diagnose`(핸드오프 JSON)를 받아 아래 형태로 답한다. `report`의 7개 키는 활용정리 문서 §9의 답변 형식이다. 가짜 RAG는 ③이 필요한 칸을 `[mock]`으로 비워 둔다.
+RAG 서비스는 `POST /diagnose`(핸드오프 JSON)를 받아 아래 형태로 답한다. `report`의 7개 키는 같은 팀 문서 「RSW용접건_매뉴얼_RAG_활용정리」 §9의 답변 형식이다. 가짜 RAG는 ③이 필요한 칸을 `[mock]`으로 비워 둔다.
 
 ```json
 {"event_id": "...", "status": "ok", "generator": "mock | rag-v1",
@@ -766,7 +766,7 @@ RAG 서비스는 `POST /diagnose`(핸드오프 JSON)를 받아 아래 형태로 
 
 | 단계 | 명령 | 통과 기준 |
 |---|---|---|
-| 1 매핑 단위 | `pytest tests/test_rag_mapping.py -v` | 11 passed, 1초 미만 |
+| 1 매핑 단위 | `pytest tests/test_rag_mapping.py -v` | 12 passed, 1초 미만 |
 | 2 전체 | `pytest` | 모두 passed(합성 데이터로 학습→API→핸드오프까지, 약 30초~1분) |
 | 3 미리보기 | `uvicorn main:app` → 브라우저 `http://127.0.0.1:8000/docs` → `POST /handoffs/preview`에 `docs/anomaly_result.example.json` 붙여넣기 | 200, `situation_ids` 첫 값 `S02` |
 | 4 실데이터 재생 | `python .py/replay.py test/test_1.csv --start-hours 156 --chunk-s 600` | 이벤트 1건, `situations=['S01']` |

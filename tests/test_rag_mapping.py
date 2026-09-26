@@ -125,3 +125,15 @@ def test_schema_keys_match_main():
                                             "direction", "deviation_z", "share", "text_ko"}
     assert set(h["fault_class"]) == {"code", "name_en", "name_ko", "terminal_code", "situation_id", "definition",
                                      "basis"}
+
+
+def test_repeat_rule_is_not_a_rule_basis():
+    """A model-critical event whose request also held a repeat rule trigger (not critical) must not be reported as
+    rule-based: the class falls back to the latest code and the trigger carries no rule code."""
+    r = copy.deepcopy(BASE)
+    r.update(severity_source="model", rule_repeat=True)
+    r["context"]["known_code_class_hint"] = None
+    h = rm.build_handoff(r)
+    assert h["fault_class"] is None and h["trigger"]["rule_code"] is None and h["trigger"]["rule_trigger_time"] is None
+    r["context"]["known_code_class_hint"] = "E01"
+    assert rm.build_handoff(r)["fault_class"]["basis"] == "latest_error_code"
